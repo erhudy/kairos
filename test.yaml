@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test
+  annotations:
+    erhudy.com/cron-pattern: "* * * * *"
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test
+  template:
+    metadata:
+      labels:
+        app: erhudy-test
+    spec:
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
