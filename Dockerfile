@@ -7,10 +7,12 @@ COPY kairostest /build/kairostest
 COPY go.mod /build/
 COPY go.sum /build/
 
-RUN go build -o kairos *.go
+RUN \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /build/kairos *.go && \
+    chmod +x kairos
 
-FROM istio/distroless:latest AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
-COPY --from=builder /build/kairos /kairos
+COPY --from=builder /build/kairos /usr/local/bin/kairos
 
-CMD ["/kairos"]
+CMD ["/usr/local/bin/kairos"]

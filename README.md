@@ -12,7 +12,15 @@ Bear in mind that as with all pod cycles in Kubernetes, the restarts will not ha
 
 ## Installing
 
-TK - for now get the image from [Docker Hub](https://hub.docker.com/r/erhudy/kairos), put it in the cluster with an appropriate Role+RoleBinding or ClusterRole+ClusterRoleBinding and let 'er rip.
+Use the Kustomize directory at `deploy`:
+
+```
+➜  kairos git:(main) kubectl apply -k deploy/install
+serviceaccount/kairos created
+clusterrole.rbac.authorization.k8s.io/kairos created
+clusterrolebinding.rbac.authorization.k8s.io/kairos created
+deployment.apps/kairos created
+```
 
 ## Todos
 
@@ -20,3 +28,5 @@ TK - for now get the image from [Docker Hub](https://hub.docker.com/r/erhudy/kai
 * more comprehensive test suite
 * de-duplicate various code paths through unhealthy `reflect` witchcraft
 * add a feature to allow backfilling restarts if the controller was down or not running during a time when a cron pattern matched the current time, and the last time the pods were restarted can be determined by inspecting the `kairos.erhudy.com/cron-last-restarted-at` annotation
+* Prometheus metrics
+* better logging

@@ -1,0 +1,39 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kairos
+  labels:
+    app.kubernetes.io/name: kairos
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kairos
+  labels:
+    app.kubernetes.io/name: kairos
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kairos
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kairos
+    spec:
+      serviceAccountName: kairos
+      containers:
+        - name: kairos
+          image: erhudy/kairos:latest
+          resources:
+            limits:
+              cpu: 50m
+              memory: 150Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+              - ALL
+            seccompProfile:
+              type: RuntimeDefault

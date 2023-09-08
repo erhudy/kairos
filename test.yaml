@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: erhudy-test
   annotations:
-    erhudy.com/cron-pattern: "* * * * *"
+    kairos.erhudy.com/cron-pattern: "* * * * *"
 spec:
   selector:
     matchLabels:
