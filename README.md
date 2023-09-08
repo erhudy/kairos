@@ -12,7 +12,7 @@ Bear in mind that as with all pod cycles in Kubernetes, the restarts will not ha
 
 ## Installing
 
-TK - for now get the image from Docker Hub, put it in the cluster with an appropriate Role+RoleBinding or ClusterRole+ClusterRoleBinding and let 'er rip.
+TK - for now get the image from [Docker Hub](https://hub.docker.com/r/erhudy/kairos), put it in the cluster with an appropriate Role+RoleBinding or ClusterRole+ClusterRoleBinding and let 'er rip.
 
 ## Todos
 
