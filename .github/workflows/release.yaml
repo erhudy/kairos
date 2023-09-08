@@ -2,8 +2,8 @@ name: Kairos build+release
 
 on:
   release:
-    paths-ignore:
-      - README.md
+    types:
+      - published
 
 jobs:
   build-and-test:
