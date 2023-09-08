@@ -38,4 +38,4 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: erhudy/kairos:latest,erhudy/kairos:${{ github.ref }}
+          tags: erhudy/kairos:latest,erhudy/kairos:${{ github.ref_name }}
