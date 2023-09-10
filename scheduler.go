@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -15,14 +16,14 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func NewScheduler(c <-chan ObjectAndSchedulerAction, k kubernetes.Interface) *Scheduler {
-	s := gocron.NewScheduler(time.UTC)
-	s.TagsUnique()
+func NewScheduler(oasaChannel <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface) *Scheduler {
+	scheduler := gocron.NewScheduler(time.UTC)
+	scheduler.TagsUnique()
 
 	return &Scheduler{
-		workchan:  c,
-		cron:      s,
-		clientset: k,
+		workchan:  oasaChannel,
+		cron:      scheduler,
+		clientset: clientset,
 		jobMap:    make(map[jobTag]JobAndCronPattern),
 	}
 }
@@ -38,11 +39,11 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 	}
 }
 
-func (s *Scheduler) processSchedulerBundle(b ObjectAndSchedulerAction) {
-	om, ok := getObjectMetaAndKind(b.obj)
+func (s *Scheduler) processSchedulerBundle(action ObjectAndSchedulerAction) {
+	om, ok := getObjectMetaAndKind(action.obj)
 	tag := getJobTag(om, ok)
 
-	switch b.action {
+	switch action.action {
 	case SCHEDULER_DELETE:
 		err := s.deleteJobByTag(tag)
 		if err != nil {
@@ -65,7 +66,7 @@ func (s *Scheduler) processSchedulerBundle(b ObjectAndSchedulerAction) {
 			klog.Errorf("cron expression for tag %s was empty", tag)
 			break
 		}
-		_, err = s.createOrUpdateJobByTag(tag, cronPattern, b.obj)
+		_, err = s.createOrUpdateJobByTag(tag, cronPattern, action.obj)
 		if err != nil {
 			klog.Errorf("error upserting job: %w", err)
 		}
@@ -122,72 +123,73 @@ func (s *Scheduler) deleteJobByTag(tag jobTag) error {
 	return nil
 }
 
-func restartFunc(ctx context.Context, k kubernetes.Interface, o runtime.Object) {
+func restartFunc(ctx context.Context, clientset kubernetes.Interface, incomingObject runtime.Object) {
 	klog.Infof("firing restartFunc at %s", time.Now())
-	om, _ := getObjectMetaAndKind(o)
+	om, _ := getObjectMetaAndKind(incomingObject)
 
 	namespace := om.GetNamespace()
 	name := om.GetName()
 
-	switch o.(type) {
+	var obj runtime.Object
+	var err error
+	switch incomingObject.(type) {
 	case *appsv1.DaemonSet:
-		daemonset, err := k.AppsV1().DaemonSets(namespace).Get(ctx, name, v1.GetOptions{})
+		obj, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, v1.GetOptions{})
 		if err != nil {
 			klog.Errorf("got error looking up DaemonSet %s/%s", namespace, name)
 			return
 		}
-		klog.Infof("got daemonset %s", daemonset.Name)
-
-		annotations := daemonset.Spec.Template.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
+		klog.Infof("got daemonset %s", name)
+	case *appsv1.Deployment:
+		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, name, v1.GetOptions{})
+		if err != nil {
+			klog.Errorf("got error looking up Deployment %s/%s", namespace, name)
+			return
 		}
-		annotations[CRON_LAST_RESTARTED_AT_KEY] = time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
-		daemonset.Spec.Template.SetAnnotations(annotations)
-		_, err = k.AppsV1().DaemonSets(namespace).Update(ctx, daemonset, v1.UpdateOptions{})
+		klog.Infof("got deployment %s", name)
+	case *appsv1.StatefulSet:
+		obj, err = clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, v1.GetOptions{})
+		if err != nil {
+			klog.Errorf("got error looking up StatefulSet %s/%s", namespace, name)
+			return
+		}
+		klog.Infof("got statefulset %s", name)
+
+	default:
+		panic(fmt.Errorf("panicked in restartFunc because got type %t", incomingObject))
+	}
+
+	template := reflect.Indirect(reflect.ValueOf(obj)).FieldByName("Spec").FieldByName("Template")
+	annotations := template.FieldByName("Annotations").Interface().(map[string]string)
+
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	annotations[CRON_LAST_RESTARTED_AT_KEY] = time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
+
+	annotationsReflectValue := reflect.ValueOf(annotations)
+	template.MethodByName("SetAnnotations").Call([]reflect.Value{annotationsReflectValue})
+
+	switch incomingObject.(type) {
+	case *appsv1.DaemonSet:
+		_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj.(*appsv1.DaemonSet), v1.UpdateOptions{})
 		if err != nil {
 			klog.Errorf("got error updating DaemonSet %s/%s", namespace, name)
 			return
 		}
 	case *appsv1.Deployment:
-		deployment, err := k.AppsV1().Deployments(namespace).Get(ctx, name, v1.GetOptions{})
-		if err != nil {
-			klog.Errorf("got error looking up Deployment %s/%s", namespace, name)
-			return
-		}
-		klog.Infof("got deployment %s", deployment.Name)
-
-		annotations := deployment.Spec.Template.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		annotations[CRON_LAST_RESTARTED_AT_KEY] = time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
-		deployment.Spec.Template.SetAnnotations(annotations)
-		_, err = k.AppsV1().Deployments(namespace).Update(ctx, deployment, v1.UpdateOptions{})
+		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj.(*appsv1.Deployment), v1.UpdateOptions{})
 		if err != nil {
 			klog.Errorf("got error updating Deployment %s/%s", namespace, name)
 			return
 		}
 	case *appsv1.StatefulSet:
-		statefulset, err := k.AppsV1().StatefulSets(namespace).Get(ctx, name, v1.GetOptions{})
-		if err != nil {
-			klog.Errorf("got error looking up StatefulSet %s/%s", namespace, name)
-			return
-		}
-		klog.Infof("got statefulset %s", statefulset.Name)
-
-		annotations := statefulset.Spec.Template.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		annotations[CRON_LAST_RESTARTED_AT_KEY] = time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
-		statefulset.Spec.Template.SetAnnotations(annotations)
-		_, err = k.AppsV1().StatefulSets(namespace).Update(ctx, statefulset, v1.UpdateOptions{})
+		_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj.(*appsv1.StatefulSet), v1.UpdateOptions{})
 		if err != nil {
 			klog.Errorf("got error updating StatefulSet %s/%s", namespace, name)
 			return
 		}
 	default:
-		panic(fmt.Errorf("panicked in restartFunc because got type %t", o))
+		panic(fmt.Errorf("panicked in restartFunc because got type %t", incomingObject))
 	}
 }
