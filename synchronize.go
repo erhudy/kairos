@@ -53,18 +53,6 @@ func (c *Controller) synchronize(key string) error {
 
 		klog.Infof("change for item %s/%s (%s)\n", om.GetNamespace(), om.GetName(), ok.GroupVersionKind())
 
-		// annotations, err := json.Marshal(om.GetAnnotations())
-		// if err != nil {
-		// 	return err
-		// }
-		// labels, err := json.Marshal(om.GetLabels())
-		// if err != nil {
-		// 	return err
-		// }
-
-		// klog.Infof("annotations: %s\n", annotations)
-		// klog.Infof("labels: %s\n", labels)
-
 		c.schedulerchan <- ObjectAndSchedulerAction{action: SCHEDULER_UPSERT, obj: obj.(runtime.Object)}
 	}
 	return nil
