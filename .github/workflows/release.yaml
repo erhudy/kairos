@@ -1,4 +1,4 @@
-name: Kairos build+release
+name: Kairos release
 
 on:
   release:
