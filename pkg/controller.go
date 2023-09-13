@@ -1,4 +1,4 @@
-package main
+package pkg
 
 import (
 	"fmt"
@@ -101,15 +101,15 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func generateDeploymentController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func GenerateDeploymentController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	return generateGenericController(clientset, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan)
 }
 
-func generateDaemonSetController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func GenerateDaemonSetController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	return generateGenericController(clientset, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan)
 }
 
-func generateStatefulSetController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func GenerateStatefulSetController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	return generateGenericController(clientset, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan)
 }
 
