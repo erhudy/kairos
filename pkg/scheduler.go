@@ -1,4 +1,4 @@
-package main
+package pkg
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-co-op/gocron"
 	appsv1 "k8s.io/api/apps/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -132,32 +132,23 @@ func restartFunc(ctx context.Context, clientset kubernetes.Interface, incomingOb
 
 	var obj runtime.Object
 	var err error
+
 	switch incomingObject.(type) {
 	case *appsv1.DaemonSet:
-		obj, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, v1.GetOptions{})
-		if err != nil {
-			klog.Errorf("got error looking up DaemonSet %s/%s", namespace, name)
-			return
-		}
-		klog.Infof("got daemonset %s", name)
+		obj, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
 	case *appsv1.Deployment:
-		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, name, v1.GetOptions{})
-		if err != nil {
-			klog.Errorf("got error looking up Deployment %s/%s", namespace, name)
-			return
-		}
-		klog.Infof("got deployment %s", name)
+		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 	case *appsv1.StatefulSet:
-		obj, err = clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, v1.GetOptions{})
-		if err != nil {
-			klog.Errorf("got error looking up StatefulSet %s/%s", namespace, name)
-			return
-		}
-		klog.Infof("got statefulset %s", name)
-
+		obj, err = clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 	default:
-		panic(fmt.Errorf("panicked in restartFunc because got type %t", incomingObject))
+		panic(fmt.Errorf("panicked in restartFunc because got type %T", incomingObject))
 	}
+
+	if err != nil {
+		klog.Errorf("restartFunc got error looking up %T %s/%s", obj, namespace, name)
+		return
+	}
+	klog.Infof("restartFunc operating on %T %s", obj, name)
 
 	template := reflect.Indirect(reflect.ValueOf(obj)).FieldByName("Spec").FieldByName("Template")
 	annotations := template.FieldByName("Annotations").Interface().(map[string]string)
@@ -166,30 +157,21 @@ func restartFunc(ctx context.Context, clientset kubernetes.Interface, incomingOb
 		annotations = make(map[string]string)
 	}
 	annotations[CRON_LAST_RESTARTED_AT_KEY] = time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
-
-	annotationsReflectValue := reflect.ValueOf(annotations)
-	template.MethodByName("SetAnnotations").Call([]reflect.Value{annotationsReflectValue})
+	template.FieldByName("Annotations").Set(reflect.ValueOf(annotations))
 
 	switch incomingObject.(type) {
 	case *appsv1.DaemonSet:
-		_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj.(*appsv1.DaemonSet), v1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("got error updating DaemonSet %s/%s", namespace, name)
-			return
-		}
+		_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj.(*appsv1.DaemonSet), metav1.UpdateOptions{})
 	case *appsv1.Deployment:
-		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj.(*appsv1.Deployment), v1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("got error updating Deployment %s/%s", namespace, name)
-			return
-		}
+		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj.(*appsv1.Deployment), metav1.UpdateOptions{})
 	case *appsv1.StatefulSet:
-		_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj.(*appsv1.StatefulSet), v1.UpdateOptions{})
-		if err != nil {
-			klog.Errorf("got error updating StatefulSet %s/%s", namespace, name)
-			return
-		}
+		_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj.(*appsv1.StatefulSet), metav1.UpdateOptions{})
 	default:
-		panic(fmt.Errorf("panicked in restartFunc because got type %t", incomingObject))
+		panic(fmt.Errorf("panicked in restartFunc because got type %T", incomingObject))
+	}
+
+	if err != nil {
+		klog.Errorf("restartFunc got error updating %T %s/%s", incomingObject, namespace, name)
+		return
 	}
 }

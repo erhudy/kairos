@@ -23,6 +23,8 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/erhudy/kairos/pkg"
 )
 
 func main() {
@@ -41,7 +43,7 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	workchan := make(chan ObjectAndSchedulerAction)
+	workchan := make(chan pkg.ObjectAndSchedulerAction)
 
 	// creates the clientset
 	clientset, err := kubernetes.NewForConfig(config)
@@ -49,11 +51,11 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	deploymentController := generateDeploymentController(clientset, namespace, workchan)
-	statefulSetController := generateStatefulSetController(clientset, namespace, workchan)
-	daemonSetController := generateDaemonSetController(clientset, namespace, workchan)
+	deploymentController := pkg.GenerateDeploymentController(clientset, namespace, workchan)
+	statefulSetController := pkg.GenerateStatefulSetController(clientset, namespace, workchan)
+	daemonSetController := pkg.GenerateDaemonSetController(clientset, namespace, workchan)
 
-	scheduler := NewScheduler(workchan, clientset)
+	scheduler := pkg.NewScheduler(workchan, clientset)
 
 	// Bind the workqueue to a cache with the help of an informer. This way we make sure that
 	// whenever the cache is updated, the pod key is added to the workqueue.
