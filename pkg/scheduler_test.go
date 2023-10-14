@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -97,9 +98,10 @@ func TestScheduler(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
 			clientset := fake.NewSimpleClientset(tt.testObject)
+			logger := zap.NewNop()
 
 			startTime := time.Now()
-			s := NewScheduler(tt.oasaChan, clientset)
+			s := NewScheduler(logger, tt.oasaChan, clientset)
 			s.cron.CustomTimer(tt.customTimer)
 			stopCh := make(chan struct{})
 			go s.Run(stopCh)

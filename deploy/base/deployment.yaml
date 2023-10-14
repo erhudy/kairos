@@ -1,11 +1,4 @@
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: kairos
-  labels:
-    app.kubernetes.io/name: kairos
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
