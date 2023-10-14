@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// derived from https://github.com/kubernetes/client-go/blob/master/examples/workqueue/main.go
+
 package main
 
 import (
 	"flag"
 
-	"k8s.io/klog/v2"
-
+	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -28,34 +29,44 @@ import (
 )
 
 func main() {
+	var debug bool
 	var kubeconfig string
 	var master string
 	var namespace string
 
+	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&master, "master", "", "master url")
 	flag.StringVar(&namespace, "namespace", "", "namespace")
 	flag.Parse()
 
+	var logger *zap.Logger
+	if debug {
+		logger, _ = zap.NewDevelopment()
+	} else {
+		logger, _ = zap.NewProduction()
+	}
+	defer logger.Sync()
+
 	// creates the connection
 	config, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
 	if err != nil {
-		klog.Fatal(err)
+		logger.Fatal("unable to build Kubernetes client config", zap.Error(err))
 	}
 
-	workchan := make(chan pkg.ObjectAndSchedulerAction)
+	workchan := make(chan pkg.ObjectAndSchedulerAction, 10)
 
 	// creates the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		klog.Fatal(err)
+		logger.Fatal("unable to build Kubernetes clientset", zap.Error(err))
 	}
 
-	deploymentController := pkg.GenerateDeploymentController(clientset, namespace, workchan)
-	statefulSetController := pkg.GenerateStatefulSetController(clientset, namespace, workchan)
-	daemonSetController := pkg.GenerateDaemonSetController(clientset, namespace, workchan)
+	deploymentController := pkg.GenerateDeploymentController(logger, clientset, namespace, workchan)
+	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan)
+	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan)
 
-	scheduler := pkg.NewScheduler(workchan, clientset)
+	scheduler := pkg.NewScheduler(logger, workchan, clientset)
 
 	// Bind the workqueue to a cache with the help of an informer. This way we make sure that
 	// whenever the cache is updated, the pod key is added to the workqueue.

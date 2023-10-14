@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"k8s.io/klog/v2"
-
+	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,13 +17,15 @@ import (
 )
 
 // NewController creates a new Controller.
-func NewController(queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func NewController(logger *zap.Logger, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, typespecimen runtime.Object, typename string, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	return &Controller{
-		informer:      informer,
-		indexer:       indexer,
-		queue:         queue,
-		typespecimen:  typespecimen,
-		schedulerchan: workchan,
+		logger:       logger,
+		informer:     informer,
+		indexer:      indexer,
+		queue:        queue,
+		typespecimen: typespecimen,
+		typename:     typename,
+		workchan:     workchan,
 	}
 }
 
@@ -58,7 +59,7 @@ func (c *Controller) handleErr(err error, key interface{}) {
 
 	// This controller retries 5 times if something goes wrong. After that, it stops trying.
 	if c.queue.NumRequeues(key) < 5 {
-		klog.Infof("Error syncing item %v: %v", key, err)
+		c.logger.Error("error syncing item", zap.Any("key", key), zap.Error(err))
 
 		// Re-enqueue the key rate limited. Based on the rate limiter on the
 		// queue and the re-enqueue history, the key will be processed later again.
@@ -69,7 +70,7 @@ func (c *Controller) handleErr(err error, key interface{}) {
 	c.queue.Forget(key)
 	// Report to an external entity that, even after several retries, we could not successfully process this key
 	utilruntime.HandleError(err)
-	klog.Infof("Dropping item %q out of the queue: %v", key, err)
+	c.logger.Info("dropping item out of the queue", zap.Any("key", key), zap.Error(err))
 }
 
 // Run begins watching and syncing.
@@ -78,7 +79,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 
 	// Let the workers stop when we are done
 	defer c.queue.ShutDown()
-	klog.Info("Starting controller")
+	c.logger.Info("starting controller", zap.String("type", c.typename))
 
 	go c.informer.Run(stopCh)
 
@@ -93,7 +94,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 	}
 
 	<-stopCh
-	klog.Info("Stopping controller")
+	c.logger.Info("stopping controller", zap.String("type", c.typename))
 }
 
 func (c *Controller) runWorker() {
@@ -101,19 +102,19 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func GenerateDeploymentController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(clientset, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan)
+func GenerateDeploymentController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+	return generateGenericController(logger, clientset, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan)
 }
 
-func GenerateDaemonSetController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(clientset, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan)
+func GenerateDaemonSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+	return generateGenericController(logger, clientset, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan)
 }
 
-func GenerateStatefulSetController(clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(clientset, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan)
+func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+	return generateGenericController(logger, clientset, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan)
 }
 
-func generateGenericController(clientset kubernetes.Interface, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func generateGenericController(logger *zap.Logger, clientset kubernetes.Interface, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	watcher := cache.NewListWatchFromClient(clientset.AppsV1().RESTClient(), typename, namespace, fields.Everything())
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
@@ -122,13 +123,20 @@ func generateGenericController(clientset kubernetes.Interface, restclient rest.I
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(key)
+				logger.Info("added object to queue", zap.String("key", key))
+			} else {
+				logger.Error("error adding object to queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(key)
+				logger.Info("added object to queue", zap.String("key", key))
+			} else {
+				logger.Error("error adding object to queue", zap.Any("obj", new), zap.String("key", key), zap.Error(err))
 			}
+
 		},
 		DeleteFunc: func(obj interface{}) {
 			// IndexerInformer uses a delta queue, therefore for deletes we have to use this
@@ -136,9 +144,13 @@ func generateGenericController(clientset kubernetes.Interface, restclient rest.I
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(key)
+				logger.Info("added object to queue", zap.String("key", key))
+			} else {
+				logger.Error("error adding object to queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
 			}
+
 		},
 	}, cache.Indexers{})
 
-	return NewController(queue, indexer, informer, typespecimen, workchan)
+	return NewController(logger, queue, indexer, informer, typespecimen, typename, workchan)
 }

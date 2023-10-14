@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"github.com/go-co-op/gocron"
+	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -10,16 +11,19 @@ import (
 
 // Controller demonstrates how to implement a controller with client-go.
 type Controller struct {
-	indexer       cache.Indexer
-	queue         workqueue.RateLimitingInterface
-	informer      cache.Controller
-	typespecimen  runtime.Object
-	schedulerchan chan<- ObjectAndSchedulerAction
+	logger       *zap.Logger
+	indexer      cache.Indexer
+	queue        workqueue.RateLimitingInterface
+	informer     cache.Controller
+	typespecimen runtime.Object
+	typename     string
+	workchan     chan<- ObjectAndSchedulerAction
 }
 
 type jobTag string
 
 type Scheduler struct {
+	logger    *zap.Logger
 	workchan  <-chan ObjectAndSchedulerAction
 	cron      *gocron.Scheduler
 	clientset kubernetes.Interface

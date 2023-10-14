@@ -3,8 +3,7 @@ package pkg
 import (
 	"fmt"
 
-	"k8s.io/klog/v2"
-
+	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,7 +16,7 @@ import (
 func (c *Controller) synchronize(key string) error {
 	obj, exists, err := c.indexer.GetByKey(key)
 	if err != nil {
-		klog.Errorf("Fetching object with key %s from store failed with %v", key, err)
+		c.logger.Error("failed fetching object from store", zap.String("key", key), zap.Error(err))
 		return err
 	}
 
@@ -36,8 +35,8 @@ func (c *Controller) synchronize(key string) error {
 	}
 
 	if !exists {
-		klog.Infof("item %s does not exist anymore\n", key)
-		c.schedulerchan <- ObjectAndSchedulerAction{action: SCHEDULER_DELETE, obj: obj.(runtime.Object)}
+		c.logger.Debug("object does not exist anymore", zap.String("key", key))
+		c.workchan <- ObjectAndSchedulerAction{action: SCHEDULER_DELETE, obj: obj.(runtime.Object)}
 	} else {
 		// Note that you also have to check the uid if you have a local controlled resource, which
 		// is dependent on the actual instance, to detect that a Pod was recreated with the same name
@@ -47,13 +46,12 @@ func (c *Controller) synchronize(key string) error {
 		om := obj.(metav1.ObjectMetaAccessor).GetObjectMeta()
 
 		if !careAboutThisObject(om) {
-			klog.Infof("don't care about item %s/%s\n", om.GetNamespace(), om.GetName())
+			c.logger.Debug("don't care about object", zap.String("namespace", om.GetNamespace()), zap.String("name", om.GetName()))
 			return nil
 		}
 
-		klog.Infof("change for item %s/%s (%s)\n", om.GetNamespace(), om.GetName(), ok.GroupVersionKind())
-
-		c.schedulerchan <- ObjectAndSchedulerAction{action: SCHEDULER_UPSERT, obj: obj.(runtime.Object)}
+		c.logger.Info("observed change for object", zap.String("key", key), zap.String("gvk", ok.GroupVersionKind().String()))
+		c.workchan <- ObjectAndSchedulerAction{action: SCHEDULER_UPSERT, obj: obj.(runtime.Object)}
 	}
 	return nil
 }
