@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -26,6 +27,7 @@ func NewController(logger *zap.Logger, queue workqueue.RateLimitingInterface, in
 		typespecimen: typespecimen,
 		typename:     typename,
 		workchan:     workchan,
+		objectMap:    &sync.Map{},
 	}
 }
 
@@ -123,18 +125,18 @@ func generateGenericController(logger *zap.Logger, clientset kubernetes.Interfac
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(key)
-				logger.Info("added object to queue", zap.String("key", key))
+				logger.Info("added object to add queue", zap.String("key", key))
 			} else {
-				logger.Error("error adding object to queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
+				logger.Error("error adding object to add queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
 			}
 		},
 		UpdateFunc: func(old interface{}, new interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(key)
-				logger.Info("added object to queue", zap.String("key", key))
+				logger.Info("added object to update queue", zap.String("key", key))
 			} else {
-				logger.Error("error adding object to queue", zap.Any("obj", new), zap.String("key", key), zap.Error(err))
+				logger.Error("error adding object to update queue", zap.Any("obj", new), zap.String("key", key), zap.Error(err))
 			}
 
 		},
@@ -144,9 +146,9 @@ func generateGenericController(logger *zap.Logger, clientset kubernetes.Interfac
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(key)
-				logger.Info("added object to queue", zap.String("key", key))
+				logger.Info("added object to delete queue", zap.String("key", key))
 			} else {
-				logger.Error("error adding object to queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
+				logger.Error("error adding object to delete queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
 			}
 
 		},

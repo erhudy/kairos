@@ -9,27 +9,23 @@ import (
 )
 
 func careAboutThisObject(om metav1.Object) bool {
-	for k := range om.GetAnnotations() {
-		if k == CRON_PATTERN_KEY {
-			return true
-		}
-	}
-	return false
+	_, ok := om.GetAnnotations()[CRON_PATTERN_KEY]
+	return ok
 }
 
-func getCronPattern(om metav1.Object) string {
-	for k, v := range om.GetAnnotations() {
-		if k == CRON_PATTERN_KEY {
-			return v
-		}
+func getCronPattern(om metav1.Object) cronPattern {
+	v, ok := om.GetAnnotations()[CRON_PATTERN_KEY]
+	if ok {
+		return cronPattern(v)
+	} else {
+		return cronPattern("")
 	}
-	return ""
 }
 
 func getObjectMetaAndKind(o runtime.Object) (metav1.Object, schema.ObjectKind) {
 	return o.(metav1.ObjectMetaAccessor).GetObjectMeta(), o.GetObjectKind()
 }
 
-func getJobTag(om metav1.Object, ok schema.ObjectKind) jobTag {
-	return jobTag(fmt.Sprintf("%s_%s/%s", ok.GroupVersionKind(), om.GetNamespace(), om.GetName()))
+func getResourceIdentifier(om metav1.Object, ok schema.ObjectKind) resourceIdentifier {
+	return resourceIdentifier(fmt.Sprintf("%s/%s/%s", ok.GroupVersionKind(), om.GetNamespace(), om.GetName()))
 }

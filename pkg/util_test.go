@@ -62,12 +62,12 @@ func TestCareAboutThisObject(t *testing.T) {
 func TestGetCronPattern(t *testing.T) {
 	tests := []struct {
 		testName   string
-		expected   string
+		expected   cronPattern
 		metaObject metav1.Object
 	}{
 		{
 			testName: "expected empty",
-			expected: "",
+			expected: cronPattern(""),
 			metaObject: &appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "Deployment",
@@ -81,7 +81,7 @@ func TestGetCronPattern(t *testing.T) {
 		},
 		{
 			testName: "expected pattern",
-			expected: "* * * * *",
+			expected: cronPattern("* * * * *"),
 			metaObject: &appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "Deployment",
@@ -106,7 +106,6 @@ func TestGetCronPattern(t *testing.T) {
 }
 
 func TestGetObjectMetaAndKind(t *testing.T) {
-
 	tests := []struct {
 		testName    string
 		expectPanic bool

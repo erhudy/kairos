@@ -1,6 +1,8 @@
 package pkg
 
 import (
+	"sync"
+
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,31 +20,32 @@ type Controller struct {
 	typespecimen runtime.Object
 	typename     string
 	workchan     chan<- ObjectAndSchedulerAction
+	objectMap    *sync.Map
 }
 
-type jobTag string
+type cronPattern string
+type resourceIdentifier string
+
+func (c cronPattern) String() string {
+	return string(c)
+}
 
 type Scheduler struct {
-	logger    *zap.Logger
-	workchan  <-chan ObjectAndSchedulerAction
-	cron      *gocron.Scheduler
-	clientset kubernetes.Interface
-	jobMap    map[jobTag]JobAndCronPattern
+	logger      *zap.Logger
+	workchan    <-chan ObjectAndSchedulerAction
+	cron        *gocron.Scheduler
+	clientset   kubernetes.Interface
+	resourceMap *sync.Map
 }
 
 type SchedulerAction int
 
 const (
-	SCHEDULER_DELETE SchedulerAction = iota
-	SCHEDULER_UPSERT
+	RESOURCE_CHANGE SchedulerAction = iota
+	RESOURCE_DELETE
 )
 
 type ObjectAndSchedulerAction struct {
 	action SchedulerAction
 	obj    runtime.Object
-}
-
-type JobAndCronPattern struct {
-	cronPattern string
-	job         *gocron.Job
 }

@@ -10,6 +10,8 @@ Kairos works in a similar manner to [Reloader](https://github.com/stakater/reloa
 
 Bear in mind that as with all pod cycles in Kubernetes, the restarts will not happen instantly, so ensure that you do not set a cron pattern so aggressive that you end up in unending `ReplicaSet` churn.
 
+Kairos also accepts multiple cron patterns in a single annotation, separated by semicolons. Multiple independent restart jobs will be registered for that resource. Kairos does not check whether any of the specified cron patterns overlap or conflict.
+
 ## Installing
 
 Use the Kustomize directory at `deploy`:

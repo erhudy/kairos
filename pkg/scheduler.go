@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-co-op/gocron"
@@ -21,11 +22,11 @@ func NewScheduler(logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, 
 	scheduler.TagsUnique()
 
 	return &Scheduler{
-		logger:    logger,
-		workchan:  workchan,
-		cron:      scheduler,
-		clientset: clientset,
-		jobMap:    make(map[jobTag]JobAndCronPattern),
+		logger:      logger,
+		workchan:    workchan,
+		cron:        scheduler,
+		clientset:   clientset,
+		resourceMap: &sync.Map{},
 	}
 }
 
@@ -42,101 +43,221 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 	}
 }
 
-func (s *Scheduler) processSchedulerBundle(action ObjectAndSchedulerAction) {
-	om, ok := getObjectMetaAndKind(action.obj)
-	tag := getJobTag(om, ok)
+func (s *Scheduler) ShowJobStatus() {
+	s.logger.Info("got signal to dump job status")
+	s.resourceMap.Range(func(key, value any) bool {
+		valueAsserted := value.(*map[cronPattern]*gocron.Job)
+		cronStrings := []string{}
+		for cp := range *valueAsserted {
+			cronStrings = append(cronStrings, fmt.Sprintf("'%s'", cp))
+		}
+		s.logger.Info(fmt.Sprintf("JOB STATUS FOR '%s': %s", key, strings.Join(cronStrings, " ")))
+		return true
+	})
+}
 
+func (s *Scheduler) processSchedulerBundle(action ObjectAndSchedulerAction) {
+	// action here refers to what is happening to the owning Deployment/DaemonSet/StatefulSet, not what is happening with the cron jobs
 	switch action.action {
-	case SCHEDULER_DELETE:
-		err := s.deleteJobByTag(tag)
+	case RESOURCE_DELETE:
+		err := s.deleteJobsForResource(action.obj)
 		if err != nil {
 			s.logger.Error("error removing job from scheduler", zap.Error(err))
 		}
-	case SCHEDULER_UPSERT:
-		jobs, err := s.cron.FindJobsByTag(string(tag))
-		if err != nil && !errors.Is(err, gocron.ErrJobNotFoundWithTag) {
-			s.logger.Error("error fetching jobs by tag from scheduler", zap.String("tag", string(tag)), zap.Error(err))
-			break
-		}
-
-		if len(jobs) > 1 {
-			s.logger.Error("got unexpected count of jobs back for tag, only expected 0 or 1", zap.Int("count", len(jobs)), zap.String("tag", string(tag)))
-			break
-		}
-
-		cronPattern := getCronPattern(om)
-		if cronPattern == "" {
-			s.logger.Error("cron expression was empty", zap.String("tag", string(tag)))
-			break
-		}
-		job, err := s.createOrUpdateJobByTag(tag, cronPattern, action.obj)
+	case RESOURCE_CHANGE:
+		err := s.reconcileJobsForResource(action.obj)
 		if err != nil {
-			s.logger.Error("error upserting job", zap.String("tag", string(tag)), zap.Error(err))
+			s.logger.Error("error reconciling jobs", zap.Error(err))
 		}
-		s.jobMap[tag] = JobAndCronPattern{
-			cronPattern: cronPattern,
-			job:         job,
-		}
-		s.logger.Info("upserted job", zap.String("tag", string(tag)), zap.String("cron-pattern", cronPattern))
 	}
 }
 
-// creates/updates the job (by deleting/recreating) and returns it for inspection
-func (s *Scheduler) createOrUpdateJobByTag(tag jobTag, cronPattern string, obj runtime.Object) (*gocron.Job, error) {
-	ctx := context.Background()
+func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
+	objm, objk := getObjectMetaAndKind(obj)
+	ri := getResourceIdentifier(objm, objk)
 
-	jcp, ok := s.jobMap[tag]
+	s.logger.Info("reconciling jobs for resource", zap.String("resource", string(ri)))
 
-	var job *gocron.Job
-	if ok {
-		job = jcp.job
-		if jcp.cronPattern == cronPattern {
-			s.logger.Debug("cron pattern matches previous, no change", zap.String("tag", string(tag)), zap.String("cron-pattern", cronPattern))
-			return job, nil
+	// load the cron patterns on the job
+	pattern := getCronPattern(objm)
+	if pattern == "" {
+		s.logger.Debug("cron expression was empty", zap.String("resource", string(ri)))
+		return nil
+	}
+
+	splitPatternsRaw := strings.Split(string(pattern), ";")
+	cronPatternsFromResource := []cronPattern{}
+	for _, p := range splitPatternsRaw {
+		cronPatternsFromResource = append(cronPatternsFromResource, cronPattern(strings.TrimSpace(p)))
+	}
+
+	// build a comparison list against the keys in the resource map for this resource to figure out what to add/delete/ignore
+	cronPatternsFromMap := []cronPattern{}
+	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+	if !ok {
+		tempMap := make(map[cronPattern]*gocron.Job)
+		s.resourceMap.Store(ri, &tempMap)
+		registeredJobsForResourceRaw = &tempMap
+	}
+	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
+	for pattern := range *registeredJobsForResource {
+		cronPatternsFromMap = append(cronPatternsFromMap, pattern)
+	}
+
+	// strings and not cronPatterns
+	patternsToAdd := []cronPattern{}
+	patternsToDelete := []cronPattern{}
+	patternsThatDidNotChangeMap := make(map[cronPattern]struct{})
+
+	// if the pattern is in our map, but is not on the resource, it has been removed and so we delete the restart job
+	for _, i := range cronPatternsFromMap {
+		found := false
+		for _, j := range cronPatternsFromResource {
+			if i == j {
+				found = true
+				break
+			}
+		}
+		if found {
+			patternsThatDidNotChangeMap[i] = struct{}{}
 		} else {
-			// in all other cases the job is either new or the cron pattern has changed -
-			// attempt to remove the job by tag and then recreate
-			err := s.deleteJobByTag(tag)
-			if err != nil {
-				return job, fmt.Errorf("error in createOrUpdateJobByTag during deletion: %w", err)
+			if i != "" {
+				patternsToDelete = append(patternsToDelete, i)
 			}
 		}
 	}
 
+	// if the pattern is on the resource, but is not in our map, it is a new pattern and so we need to make a restart job
+	for _, i := range cronPatternsFromResource {
+		found := false
+		for _, j := range cronPatternsFromMap {
+			if i == j {
+				found = true
+				break
+			}
+		}
+		if found {
+			patternsThatDidNotChangeMap[i] = struct{}{}
+		} else {
+			if i != "" {
+				patternsToAdd = append(patternsToAdd, i)
+			}
+		}
+	}
+
+	patternsThatDidNotChange := []cronPattern{}
+	for k := range patternsThatDidNotChangeMap {
+		patternsThatDidNotChange = append(patternsThatDidNotChange, k)
+	}
+
+	if len(patternsToAdd) > 0 {
+		s.logger.Debug("patterns to add", zap.Stringers("patterns", patternsToAdd))
+	}
+	if len(patternsToDelete) > 0 {
+		s.logger.Debug("patterns to delete", zap.Stringers("patterns", patternsToDelete))
+	}
+	if len(patternsThatDidNotChange) > 0 {
+		s.logger.Debug("patterns that did not change", zap.Stringers("patterns", patternsThatDidNotChange))
+	}
+
+	for _, p := range patternsToAdd {
+		err := s.createJob(p, ri, obj)
+		if err != nil {
+			return fmt.Errorf("error while adding job during reconcile: %w", err)
+		}
+	}
+	for _, p := range patternsToDelete {
+		job := (*registeredJobsForResource)[p]
+		err := s.deleteJob(p, ri, job)
+		if err != nil {
+			return fmt.Errorf("error while deleting job during reconcile: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// creates/updates the job (by deleting/recreating) and returns it for inspection
+func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime.Object) error {
+	ctx := context.Background()
+
+	var job *gocron.Job
+
 	// if 5 fields, regular cron, if 6 fields, cron with seconds, otherwise freak out
 	var cronFunc func(string) *gocron.Scheduler
 
-	switch l := len(strings.Split(cronPattern, " ")); {
+	switch l := len(strings.Split(string(cp), " ")); {
 	case l == 5:
 		cronFunc = s.cron.Cron
 	case l == 6:
 		cronFunc = s.cron.CronWithSeconds
 	default:
-		return job, fmt.Errorf("got %d fields splitting cron expression '%s', expected 5 or 6", l, cronPattern)
+		return fmt.Errorf("got %d fields splitting cron expression '%s', expected 5 or 6", l, cp)
 	}
+
+	tag := fmt.Sprintf("%s--%s", ri, cp)
 
 	var err error
-	job, err = cronFunc(cronPattern).Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj)
+	job, err = cronFunc(string(cp)).Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj)
 	if err != nil {
-		return job, fmt.Errorf("error in createOrUpdateJobByTag during creation: %w", err)
+		return fmt.Errorf("error in createJob during creation: %w", err)
 	}
-	return job, nil
+
+	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+	if !ok {
+		tempMap := make(map[cronPattern]*gocron.Job)
+		s.resourceMap.Store(ri, &tempMap)
+		registeredJobsForResourceRaw = &tempMap
+	}
+	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
+
+	(*registeredJobsForResource)[cp] = job
+
+	return nil
 }
 
-func (s *Scheduler) deleteJobByTag(tag jobTag) error {
-	s.logger.Info("deleting job by tag", zap.String("tag", string(tag)))
-	err := s.cron.RemoveByTag(string(tag))
+func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
+	objm, objk := getObjectMetaAndKind(obj)
+	ri := getResourceIdentifier(objm, objk)
+
+	s.logger.Info("deleting jobs for resource", zap.String("resource", string(ri)))
+
+	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+	if !ok {
+		return fmt.Errorf("resource %s not found in resource map", ri)
+	}
+	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
+
+	for cronPattern, job := range *registeredJobsForResource {
+		err := s.deleteJob(cronPattern, ri, job)
+		if err != nil {
+			return err
+		}
+	}
+
+	s.resourceMap.Delete(ri)
+	return nil
+}
+
+func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job) error {
+	err := s.cron.RemoveByID(job)
 	if err != nil {
-		if errors.Is(err, gocron.ErrJobNotFoundWithTag) {
-			// nonexistent tag is not considered fatal, just some sloppy bookkeeping somewhere that shouldn't happen
-			s.logger.Error("requested to delete nonexistent tag", zap.String("tag", string(tag)))
-		} else {
+		if !errors.Is(err, gocron.ErrJobNotFound) {
 			return fmt.Errorf("error in deleteJob: %w", err)
 		}
 	} else {
-		s.logger.Info("deleted tag", zap.String("tag", string(tag)))
+		registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+		if !ok {
+			return fmt.Errorf("resource %s not found in resource map", ri)
+		}
+		registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
+		delete(*registeredJobsForResource, cp)
+		s.logger.Info(
+			"deleted job",
+			zap.String("resource", string(ri)),
+			zap.String("cron-pattern", string(cp)),
+		)
 	}
-	delete(s.jobMap, tag)
 	return nil
 }
 

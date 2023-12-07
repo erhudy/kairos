@@ -20,6 +20,9 @@ package main
 
 import (
 	"flag"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
@@ -67,6 +70,14 @@ func main() {
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan)
 
 	scheduler := pkg.NewScheduler(logger, workchan, clientset)
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGUSR1)
+	go func() {
+		for range signalChan {
+			scheduler.ShowJobStatus()
+		}
+	}()
 
 	// Bind the workqueue to a cache with the help of an informer. This way we make sure that
 	// whenever the cache is updated, the pod key is added to the workqueue.
