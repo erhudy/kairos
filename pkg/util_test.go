@@ -1,6 +1,8 @@
 package pkg
 
 import (
+	"time"
+
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -62,12 +64,18 @@ func TestCareAboutThisObject(t *testing.T) {
 func TestGetCronPattern(t *testing.T) {
 	tests := []struct {
 		testName   string
-		expected   cronPattern
+		expected   cronPatternWithTimezone
+		expectErr  bool
+		location   func() (*time.Location, error)
 		metaObject metav1.Object
 	}{
 		{
 			testName: "expected empty",
-			expected: cronPattern(""),
+			expected: cronPatternWithTimezone{
+				cronPattern: "",
+				location:    time.UTC,
+			},
+			location: nil,
 			metaObject: &appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "Deployment",
@@ -81,7 +89,10 @@ func TestGetCronPattern(t *testing.T) {
 		},
 		{
 			testName: "expected pattern",
-			expected: cronPattern("* * * * *"),
+			expected: cronPatternWithTimezone{
+				cronPattern: "* * * * *",
+				location:    time.UTC,
+			},
 			metaObject: &appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{
 					Kind:       "Deployment",
@@ -96,11 +107,53 @@ func TestGetCronPattern(t *testing.T) {
 				},
 			},
 		},
+		{
+			testName: "expected pattern with America/New_York",
+			expected: cronPatternWithTimezone{
+				cronPattern: "* * * * *",
+				// location will be computed via the location struct field
+			},
+			location: func() (*time.Location, error) {
+				return time.LoadLocation("America/New_York")
+			},
+			metaObject: &appsv1.Deployment{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Deployment",
+					APIVersion: "apps/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hello",
+					Namespace: "what",
+					Annotations: map[string]string{
+						CRON_PATTERN_KEY: "* * * * *",
+						TIME_ZONE_KEY:    "America/New_York",
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			require.Equal(t, tt.expected, getCronPattern(tt.metaObject))
+			cronPattern := getCronPatternString(tt.metaObject)
+
+			var location *time.Location
+			var err error
+
+			location, err = getTimeLocation(tt.metaObject)
+			if tt.expectErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			if tt.location != nil {
+				location, err = tt.location()
+				require.NoError(t, err)
+				tt.expected.location = location
+			}
+
+			require.Equal(t, tt.expected, cronPatternWithTimezone{cronPattern: cronPattern, location: location})
 		})
 	}
 }

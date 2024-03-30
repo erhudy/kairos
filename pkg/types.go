@@ -1,7 +1,9 @@
 package pkg
 
 import (
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
@@ -23,11 +25,14 @@ type Controller struct {
 	objectMap    *sync.Map
 }
 
-type cronPattern string
+type cronPatternWithTimezone struct {
+	cronPattern string
+	location    *time.Location
+}
 type resourceIdentifier string
 
-func (c cronPattern) String() string {
-	return string(c)
+func (c cronPatternWithTimezone) String() string {
+	return fmt.Sprintf("%s_%s", c.cronPattern, c.location.String())
 }
 
 type Scheduler struct {
