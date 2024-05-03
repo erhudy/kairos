@@ -3,7 +3,6 @@ package pkg
 import (
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
@@ -26,13 +25,17 @@ type Controller struct {
 }
 
 type cronPatternWithTimezone struct {
-	cronPattern string
-	location    *time.Location
+	cronPattern    string
+	locationString string // not using *time.Location here because it causes problems when comparing two patterns
 }
 type resourceIdentifier string
 
 func (c cronPatternWithTimezone) String() string {
-	return fmt.Sprintf("%s_%s", c.cronPattern, c.location.String())
+	return fmt.Sprintf("%s_%s", c.cronPattern, c.locationString)
+}
+
+func (c cronPatternWithTimezone) Equals(d cronPatternWithTimezone) bool {
+	return c.cronPattern == d.cronPattern && c.locationString == d.locationString
 }
 
 type Scheduler struct {

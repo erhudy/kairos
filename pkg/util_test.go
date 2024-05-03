@@ -72,8 +72,8 @@ func TestGetCronPattern(t *testing.T) {
 		{
 			testName: "expected empty",
 			expected: cronPatternWithTimezone{
-				cronPattern: "",
-				location:    time.UTC,
+				cronPattern:    "",
+				locationString: time.UTC.String(),
 			},
 			location: nil,
 			metaObject: &appsv1.Deployment{
@@ -90,8 +90,8 @@ func TestGetCronPattern(t *testing.T) {
 		{
 			testName: "expected pattern",
 			expected: cronPatternWithTimezone{
-				cronPattern: "* * * * *",
-				location:    time.UTC,
+				cronPattern:    "* * * * *",
+				locationString: time.UTC.String(),
 			},
 			metaObject: &appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{
@@ -150,10 +150,10 @@ func TestGetCronPattern(t *testing.T) {
 			if tt.location != nil {
 				location, err = tt.location()
 				require.NoError(t, err)
-				tt.expected.location = location
+				tt.expected.locationString = location.String()
 			}
 
-			require.Equal(t, tt.expected, cronPatternWithTimezone{cronPattern: cronPattern, location: location})
+			require.Equal(t, tt.expected, cronPatternWithTimezone{cronPattern: cronPattern, locationString: location.String()})
 		})
 	}
 }

@@ -90,10 +90,10 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		return fmt.Errorf("error getting time location: %w", err)
 	}
 
-	splitPatternsRaw := strings.Split(string(pattern), ";")
+	splitPatternsRaw := strings.Split(strings.TrimSpace(strings.TrimSuffix(string(pattern), ";")), ";")
 	cronPatternsWithTZFromResource := []cronPatternWithTimezone{}
 	for _, p := range splitPatternsRaw {
-		cronPatternsWithTZFromResource = append(cronPatternsWithTZFromResource, cronPatternWithTimezone{cronPattern: strings.TrimSpace(p), location: timezone})
+		cronPatternsWithTZFromResource = append(cronPatternsWithTZFromResource, cronPatternWithTimezone{cronPattern: strings.TrimSpace(p), locationString: timezone.String()})
 	}
 
 	// build a comparison list against the keys in the resource map for this resource to figure out what to add/delete/ignore
@@ -114,11 +114,13 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	patternsToDelete := []cronPatternWithTimezone{}
 	patternsThatDidNotChangeMap := make(map[cronPatternWithTimezone]struct{})
 
+	s.logger.Debug("patterns already registered", zap.String("resource", string(ri)), zap.Stringers("patterns", cronPatternsWithTZFromMap))
+
 	// if the pattern is in our map, but is not on the resource, it has been removed and so we delete the restart job
 	for _, i := range cronPatternsWithTZFromMap {
 		found := false
 		for _, j := range cronPatternsWithTZFromResource {
-			if i == j {
+			if i.Equals(j) {
 				found = true
 				break
 			}
@@ -136,7 +138,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	for _, i := range cronPatternsWithTZFromResource {
 		found := false
 		for _, j := range cronPatternsWithTZFromMap {
-			if i == j {
+			if i.Equals(j) {
 				found = true
 				break
 			}
@@ -205,7 +207,11 @@ func (s *Scheduler) createJob(cp cronPatternWithTimezone, ri resourceIdentifier,
 	var err error
 
 	scheduler := cronFunc(cp.cronPattern)
-	scheduler.ChangeLocation(cp.location)
+	location, err := time.LoadLocation(cp.locationString)
+	if err != nil {
+		return fmt.Errorf("could not parse location '%s': %w", cp.locationString, err)
+	}
+	scheduler.ChangeLocation(location)
 	job, err = scheduler.Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj)
 	if err != nil {
 		return fmt.Errorf("error in createJob during creation: %w", err)
@@ -264,7 +270,7 @@ func (s *Scheduler) deleteJob(cp cronPatternWithTimezone, ri resourceIdentifier,
 			"deleted job",
 			zap.String("resource", string(ri)),
 			zap.String("cron-pattern", string(cp.cronPattern)),
-			zap.String("timezone", cp.location.String()),
+			zap.String("timezone", cp.locationString),
 		)
 	}
 	return nil
