@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +18,7 @@ func careAboutThisObject(om metav1.Object) bool {
 func getCronPatternString(om metav1.Object) string {
 	v, ok := om.GetAnnotations()[CRON_PATTERN_KEY]
 	if ok {
-		return v
+		return strings.TrimSpace(strings.TrimSuffix(v, ";"))
 	} else {
 		return ""
 	}
