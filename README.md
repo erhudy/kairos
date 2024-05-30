@@ -12,6 +12,12 @@ Bear in mind that as with all pod cycles in Kubernetes, the restarts will not ha
 
 Kairos also accepts multiple cron patterns in a single annotation, separated by semicolons. Multiple independent restart jobs will be registered for that resource. Kairos does not check whether any of the specified cron patterns overlap or conflict.
 
+### Timezone handling
+
+Kairos starts up with the scheduler running on local time by default, determined through whatever mechanism Go uses to figure out the local timezone. To override that and specify a particular timezone, indicate it with the `-timezone` flag.
+
+Timezones for particular jobs may be set by prefixing each cron pattern with `TZ=` or `CRON_TZ=`, e.g. `TZ=America/New_York 5 12 * * *`.
+
 ## Installing
 
 Use the Kustomize directory at `deploy`:

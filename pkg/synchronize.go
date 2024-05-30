@@ -52,9 +52,9 @@ func (c *Controller) synchronize(key string) error {
 
 		// Note that you also have to check the uid if you have a local controlled resource, which
 		// is dependent on the actual instance, to detect that a Pod was recreated with the same name
-		if err != nil {
-			return err
-		}
+		// if err != nil {
+		// 	return err
+		// }
 		objm := obj.(metav1.ObjectMetaAccessor).GetObjectMeta()
 
 		if !careAboutThisObject(objm) {

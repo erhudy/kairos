@@ -105,19 +105,19 @@ func (c *Controller) runWorker() {
 }
 
 func GenerateDeploymentController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(logger, clientset, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan)
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan)
 }
 
 func GenerateDaemonSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(logger, clientset, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan)
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan)
 }
 
 func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(logger, clientset, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan)
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan)
 }
 
-func generateGenericController(logger *zap.Logger, clientset kubernetes.Interface, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	watcher := cache.NewListWatchFromClient(clientset.AppsV1().RESTClient(), typename, namespace, fields.Everything())
+func generateGenericController(logger *zap.Logger, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
+	watcher := cache.NewListWatchFromClient(restclient, typename, namespace, fields.Everything())
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
 	indexer, informer := cache.NewIndexerInformer(watcher, typespecimen, 0, cache.ResourceEventHandlerFuncs{

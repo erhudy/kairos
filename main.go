@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
@@ -36,11 +37,13 @@ func main() {
 	var kubeconfig string
 	var master string
 	var namespace string
+	var tzstring string
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&master, "master", "", "master url")
 	flag.StringVar(&namespace, "namespace", "", "namespace")
+	flag.StringVar(&tzstring, "timezone", "Local", "timezone that the scheduler should consider the system clock to be")
 	flag.Parse()
 
 	var logger *zap.Logger
@@ -50,6 +53,14 @@ func main() {
 		logger, _ = zap.NewProduction()
 	}
 	defer logger.Sync()
+
+	timezone, err := time.LoadLocation(tzstring)
+	if err != nil {
+		logger.Fatal("unable to process given timezone", zap.String("tz", tzstring), zap.Error(err))
+	}
+
+	logger.Info("operating with timezone", zap.String("tz", timezone.String()))
+	logger.Info("current time", zap.String("given", time.Now().In(timezone).String()), zap.String("utc", time.Now().UTC().String()))
 
 	// creates the connection
 	config, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
@@ -69,7 +80,7 @@ func main() {
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan)
 
-	scheduler := pkg.NewScheduler(logger, workchan, clientset)
+	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset)
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGUSR1)

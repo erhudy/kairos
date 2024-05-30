@@ -3,7 +3,6 @@ package pkg
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -22,19 +21,6 @@ func getCronPatternString(om metav1.Object) string {
 	} else {
 		return ""
 	}
-}
-
-func getTimeLocation(om metav1.Object) (*time.Location, error) {
-	v, ok := om.GetAnnotations()[TIME_ZONE_KEY]
-	timezone := "UTC"
-	if ok {
-		timezone = v
-	}
-	location, err := time.LoadLocation(timezone)
-	if err != nil {
-		return nil, err
-	}
-	return location, nil
 }
 
 func getObjectMetaAndKind(o runtime.Object) (metav1.Object, schema.ObjectKind) {

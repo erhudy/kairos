@@ -17,8 +17,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func NewScheduler(logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface) *Scheduler {
-	scheduler := gocron.NewScheduler(time.UTC)
+func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface) *Scheduler {
+	scheduler := gocron.NewScheduler(timezone)
 	scheduler.TagsUnique()
 
 	return &Scheduler{
@@ -46,12 +46,34 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 func (s *Scheduler) ShowJobStatus() {
 	s.logger.Info("got signal to dump job status")
 	s.resourceMap.Range(func(key, value any) bool {
-		valueAsserted := value.(*map[cronPatternWithTimezone]*gocron.Job)
-		cronStrings := []string{}
-		for cp := range *valueAsserted {
-			cronStrings = append(cronStrings, fmt.Sprintf("'%s'", cp))
+		valueAsserted := value.(*map[cronPattern]*gocron.Job)
+		jobs := []struct {
+			cronStrings cronPattern
+			job         *gocron.Job
+		}{}
+		for cp, job := range *valueAsserted {
+			jobs = append(jobs, struct {
+				cronStrings cronPattern
+				job         *gocron.Job
+			}{
+				cronStrings: cp,
+				job:         job,
+			})
 		}
-		s.logger.Info(fmt.Sprintf("JOB STATUS FOR '%s': %s", key, strings.Join(cronStrings, " ")))
+		s.logger.Info(fmt.Sprintf("JOB STATUS FOR '%s'", key))
+		for _, j := range jobs {
+			lastRunStr := j.job.LastRun().String()
+			nextRun := j.job.NextRun()
+			nextRunStr := nextRun.String()
+			nextRunInStr := time.Until(nextRun).String()
+			s.logger.Info(fmt.Sprintf(" | tags: '%s'", strings.Join(j.job.Tags(), ",")))
+			s.logger.Info(fmt.Sprintf(" | cron pattern: '%s'", j.cronStrings))
+			s.logger.Info(fmt.Sprintf(" | last run: %s", lastRunStr))
+			s.logger.Info(fmt.Sprintf(" | next run: %s", nextRunStr))
+			s.logger.Info(fmt.Sprintf(" | next run in: %s", nextRunInStr))
+			s.logger.Info("------")
+		}
+		s.logger.Info("----------------------------------")
 		return true
 	})
 }
@@ -85,42 +107,37 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		return nil
 	}
 
-	timezone, err := getTimeLocation(objm)
-	if err != nil {
-		return fmt.Errorf("error getting time location: %w", err)
-	}
-
 	splitPatternsRaw := strings.Split(strings.TrimSpace(strings.TrimSuffix(string(pattern), ";")), ";")
-	cronPatternsWithTZFromResource := []cronPatternWithTimezone{}
+	cronPatternsFromResource := []cronPattern{}
 	for _, p := range splitPatternsRaw {
-		cronPatternsWithTZFromResource = append(cronPatternsWithTZFromResource, cronPatternWithTimezone{cronPattern: strings.TrimSpace(p), locationString: timezone.String()})
+		cronPatternsFromResource = append(cronPatternsFromResource, cronPattern(strings.TrimSpace(p)))
 	}
 
 	// build a comparison list against the keys in the resource map for this resource to figure out what to add/delete/ignore
-	cronPatternsWithTZFromMap := []cronPatternWithTimezone{}
+	cronPatternsFromMap := cronPatterns{}
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
-		tempMap := make(map[cronPatternWithTimezone]*gocron.Job)
+		tempMap := make(map[cronPattern]*gocron.Job)
 		s.resourceMap.Store(ri, &tempMap)
 		registeredJobsForResourceRaw = &tempMap
 	}
-	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPatternWithTimezone]*gocron.Job)
+	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 	for pattern := range *registeredJobsForResource {
-		cronPatternsWithTZFromMap = append(cronPatternsWithTZFromMap, pattern)
+		cronPatternsFromMap = append(cronPatternsFromMap, pattern)
 	}
 
 	// strings and not cronPatterns
-	patternsToAdd := []cronPatternWithTimezone{}
-	patternsToDelete := []cronPatternWithTimezone{}
-	patternsThatDidNotChangeMap := make(map[cronPatternWithTimezone]struct{})
+	patternsToAdd := []cronPattern{}
+	patternsToDelete := []cronPattern{}
+	patternsThatDidNotChangeMap := make(map[cronPattern]struct{})
 
-	s.logger.Debug("patterns already registered", zap.String("resource", string(ri)), zap.Stringers("patterns", cronPatternsWithTZFromMap))
+	s.logger.Debug("patterns already registered", zap.String("resource", string(ri)), zap.Stringers("patterns", cronPatternsFromMap))
 
 	// if the pattern is in our map, but is not on the resource, it has been removed and so we delete the restart job
-	for _, i := range cronPatternsWithTZFromMap {
+	for _, i := range cronPatternsFromMap {
 		found := false
-		for _, j := range cronPatternsWithTZFromResource {
-			if i.Equals(j) {
+		for _, j := range cronPatternsFromResource {
+			if i == j {
 				found = true
 				break
 			}
@@ -135,10 +152,10 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	}
 
 	// if the pattern is on the resource, but is not in our map, it is a new pattern and so we need to make a restart job
-	for _, i := range cronPatternsWithTZFromResource {
+	for _, i := range cronPatternsFromResource {
 		found := false
-		for _, j := range cronPatternsWithTZFromMap {
-			if i.Equals(j) {
+		for _, j := range cronPatternsFromMap {
+			if i == j {
 				found = true
 				break
 			}
@@ -152,7 +169,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		}
 	}
 
-	patternsThatDidNotChange := []cronPatternWithTimezone{}
+	patternsThatDidNotChange := cronPatterns{}
 	for k := range patternsThatDidNotChangeMap {
 		patternsThatDidNotChange = append(patternsThatDidNotChange, k)
 	}
@@ -185,18 +202,31 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 }
 
 // creates/updates the job (by deleting/recreating) and returns it for inspection
-func (s *Scheduler) createJob(cp cronPatternWithTimezone, ri resourceIdentifier, obj runtime.Object) error {
+func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime.Object) error {
 	ctx := context.Background()
+
+	cpString := string(cp)
 
 	var job *gocron.Job
 
 	// if 5 fields, regular cron, if 6 fields, cron with seconds, otherwise freak out
 	var cronFunc func(string) *gocron.Scheduler
 
-	switch l := len(strings.Split(string(cp.cronPattern), " ")); {
-	case l == 5:
+	s.logger.Debug("working on cp", zap.String("cp", cp.String()))
+
+	expectedCountForCron := 5
+	expectedCountForCronWithSeconds := 6
+	// if TZ/CRON_TZ specification is present, expect an extra field when we naively split string
+
+	if strings.HasPrefix(cpString, "TZ=") || strings.HasPrefix(cpString, "CRON_TZ=") {
+		expectedCountForCron += 1
+		expectedCountForCronWithSeconds += 1
+	}
+
+	switch l := len(strings.Split(cpString, " ")); {
+	case l == expectedCountForCron:
 		cronFunc = s.cron.Cron
-	case l == 6:
+	case l == expectedCountForCronWithSeconds:
 		cronFunc = s.cron.CronWithSeconds
 	default:
 		return fmt.Errorf("got %d fields splitting cron expression '%s', expected 5 or 6", l, cp)
@@ -206,12 +236,7 @@ func (s *Scheduler) createJob(cp cronPatternWithTimezone, ri resourceIdentifier,
 
 	var err error
 
-	scheduler := cronFunc(cp.cronPattern)
-	location, err := time.LoadLocation(cp.locationString)
-	if err != nil {
-		return fmt.Errorf("could not parse location '%s': %w", cp.locationString, err)
-	}
-	scheduler.ChangeLocation(location)
+	scheduler := cronFunc(cpString)
 	job, err = scheduler.Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj)
 	if err != nil {
 		return fmt.Errorf("error in createJob during creation: %w", err)
@@ -219,11 +244,11 @@ func (s *Scheduler) createJob(cp cronPatternWithTimezone, ri resourceIdentifier,
 
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
-		tempMap := make(map[cronPatternWithTimezone]*gocron.Job)
+		tempMap := make(map[cronPattern]*gocron.Job)
 		s.resourceMap.Store(ri, &tempMap)
 		registeredJobsForResourceRaw = &tempMap
 	}
-	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPatternWithTimezone]*gocron.Job)
+	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 
 	(*registeredJobsForResource)[cp] = job
 
@@ -240,7 +265,7 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	if !ok {
 		return fmt.Errorf("resource %s not found in resource map", ri)
 	}
-	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPatternWithTimezone]*gocron.Job)
+	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 
 	for cronPattern, job := range *registeredJobsForResource {
 		err := s.deleteJob(cronPattern, ri, job)
@@ -253,7 +278,7 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	return nil
 }
 
-func (s *Scheduler) deleteJob(cp cronPatternWithTimezone, ri resourceIdentifier, job *gocron.Job) error {
+func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job) error {
 	err := s.cron.RemoveByID(job)
 	if err != nil {
 		if !errors.Is(err, gocron.ErrJobNotFound) {
@@ -264,13 +289,12 @@ func (s *Scheduler) deleteJob(cp cronPatternWithTimezone, ri resourceIdentifier,
 		if !ok {
 			return fmt.Errorf("resource %s not found in resource map", ri)
 		}
-		registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPatternWithTimezone]*gocron.Job)
+		registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 		delete(*registeredJobsForResource, cp)
 		s.logger.Info(
 			"deleted job",
 			zap.String("resource", string(ri)),
-			zap.String("cron-pattern", string(cp.cronPattern)),
-			zap.String("timezone", cp.locationString),
+			zap.String("cron-pattern", string(cp)),
 		)
 	}
 	return nil
