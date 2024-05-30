@@ -1,7 +1,7 @@
 package pkg
 
 import (
-	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/go-co-op/gocron"
@@ -24,19 +24,23 @@ type Controller struct {
 	objectMap    *sync.Map
 }
 
-type cronPatternWithTimezone struct {
-	cronPattern    string
-	locationString string // not using *time.Location here because it causes problems when comparing two patterns
+type cronPattern string
+
+func (c cronPattern) String() string {
+	return string(c)
 }
+
+type cronPatterns []cronPattern
+
+func (c cronPatterns) String() string {
+	ss := []string{}
+	for _, x := range c {
+		ss = append(ss, string(x))
+	}
+	return strings.Join(ss, ", ")
+}
+
 type resourceIdentifier string
-
-func (c cronPatternWithTimezone) String() string {
-	return fmt.Sprintf("%s_%s", c.cronPattern, c.locationString)
-}
-
-func (c cronPatternWithTimezone) Equals(d cronPatternWithTimezone) bool {
-	return c.cronPattern == d.cronPattern && c.locationString == d.locationString
-}
 
 type Scheduler struct {
 	logger      *zap.Logger

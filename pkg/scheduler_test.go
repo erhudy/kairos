@@ -19,6 +19,7 @@ func TestScheduler(t *testing.T) {
 	tests := []struct {
 		testName                                string
 		customTimer                             func(d time.Duration, f func()) *time.Timer
+		tzstring                                string
 		testObject                              runtime.Object
 		oasaChan                                chan ObjectAndSchedulerAction
 		specShouldHaveLastRestartedAtAnnotation bool
@@ -100,15 +101,17 @@ func TestScheduler(t *testing.T) {
 			clientset := fake.NewSimpleClientset(tt.testObject)
 			logger := zap.NewNop()
 
+			tz, err := time.LoadLocation(tt.tzstring)
+			require.NoError(t, err)
+
 			startTime := time.Now()
-			s := NewScheduler(logger, tt.oasaChan, clientset)
+			s := NewScheduler(tz, logger, tt.oasaChan, clientset)
 			s.cron.CustomTimer(tt.customTimer)
 			stopCh := make(chan struct{})
 			go s.Run(stopCh)
 			time.Sleep(tt.timeToWaitBeforeCheckingClientset)
 
 			var obj runtime.Object
-			var err error
 			switch tt.testObject.(type) {
 			case *appsv1.DaemonSet:
 				obj, err = clientset.AppsV1().DaemonSets("what").Get(context.TODO(), "hello", metav1.GetOptions{})

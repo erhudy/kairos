@@ -191,8 +191,29 @@ metadata:
   name: erhudy-test-semicolon-every-odd-minute-with-timezone
   namespace: namespace-2
   annotations:
-    kairos.erhudy.com/cron-pattern: "1,3,5,7,9 * * * *; 11,13,15,17,19 * * * *; 21,23,25,27,29 * * * *; 31,33,35,37,39 * * * *; 41,43,45,47,49 * * * *; 51,53,55,57,59 * * * *;"
-    kairos.erhudy.com/cron-timezone: America/New_York
+    kairos.erhudy.com/cron-pattern: "TZ=America/New_York 11,13,15,17,19 12 * * *; TZ=America/New_York 21,23,25,27,29 12 * * *; TZ=America/New_York 31,33,35,37,39 12 * * *; TZ=America/New_York 41,43,45,47,49 12 * * *; TZ=America/New_York 51,53,55,57,59 12 * * *; TZ=America/New_York 1,3,5,7,9 12 * * *;"
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-semicolon-every-odd-minute
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-semicolon-every-odd-minute
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-more-timezones
+  namespace: namespace-2
+  annotations:
+    kairos.erhudy.com/cron-pattern: "TZ=America/New_York 0 16 * * *; TZ=America/New_York 12 18 3 * *" 
 spec:
   selector:
     matchLabels:
