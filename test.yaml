@@ -11,14 +11,18 @@ metadata:
   namespace: namespace-1
   annotations:
     kairos.erhudy.com/cron-pattern: "* * * * *"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-every-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-every-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -33,14 +37,18 @@ metadata:
   namespace: namespace-1
   annotations:
     kairos.erhudy.com/cron-pattern: "*/3 * * * *"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-every-three-minutes
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-every-three-minutes
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -55,14 +63,18 @@ metadata:
   namespace: namespace-1
   annotations:
     kairos.erhudy.com/cron-pattern: "*/4 * * * *"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-every-four-minutes
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-every-four-minutes
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -77,14 +89,18 @@ metadata:
   namespace: namespace-1
   annotations:
     kairos.erhudy.com/cron-pattern: "1,3,5,7,9 * * * *; 11,13,15,17,19 * * * *; 21,23,25,27,29 * * * *; 31,33,35,37,39 * * * *; 41,43,45,47,49 * * * *; 51,53,55,57,59 * * * *;"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-semicolon-every-odd-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-semicolon-every-odd-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -104,14 +120,18 @@ metadata:
   namespace: namespace-2
   annotations:
     kairos.erhudy.com/cron-pattern: "*/2 * * * *"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-every-even-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-every-even-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -126,14 +146,18 @@ metadata:
   namespace: namespace-2
   annotations:
     kairos.erhudy.com/cron-pattern: "*/5 * * * *"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-every-fifth-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-every-fifth-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -148,14 +172,18 @@ metadata:
   namespace: namespace-2
   annotations:
     kairos.erhudy.com/cron-pattern: "* * * * *"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-every-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-every-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -170,14 +198,18 @@ metadata:
   namespace: namespace-2
   annotations:
     kairos.erhudy.com/cron-pattern: "1,3,5,7,9 * * * *; 11,13,15,17,19 * * * *; 21,23,25,27,29 * * * *; 31,33,35,37,39 * * * *; 41,43,45,47,49 * * * *; 51,53,55,57,59 * * * *;"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-semicolon-every-odd-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-semicolon-every-odd-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -192,14 +224,18 @@ metadata:
   namespace: namespace-2
   annotations:
     kairos.erhudy.com/cron-pattern: "TZ=America/New_York 11,13,15,17,19 12 * * *; TZ=America/New_York 21,23,25,27,29 12 * * *; TZ=America/New_York 31,33,35,37,39 12 * * *; TZ=America/New_York 41,43,45,47,49 12 * * *; TZ=America/New_York 51,53,55,57,59 12 * * *; TZ=America/New_York 1,3,5,7,9 12 * * *;"
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-semicolon-every-odd-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-semicolon-every-odd-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:
@@ -208,20 +244,24 @@ spec:
           command: ["sleep", "infinity"]
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: erhudy-test-more-timezones
   namespace: namespace-2
   annotations:
     kairos.erhudy.com/cron-pattern: "TZ=America/New_York 0 16 * * *; TZ=America/New_York 12 18 3 * *" 
+  labels:
+    kairos-test: "true"
 spec:
   selector:
     matchLabels:
       app: erhudy-test-semicolon-every-odd-minute
+      kairos-test: "true"
   template:
     metadata:
       labels:
         app: erhudy-test-semicolon-every-odd-minute
+        kairos-test: "true"
     spec:
       terminationGracePeriodSeconds: 0
       containers:

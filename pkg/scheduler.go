@@ -12,6 +12,7 @@ import (
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -192,7 +193,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	}
 	for _, p := range patternsToDelete {
 		job := (*registeredJobsForResource)[p]
-		err := s.deleteJob(p, ri, job)
+		err := s.deleteJob(p, ri, job, obj)
 		if err != nil {
 			return fmt.Errorf("error while deleting job during reconcile: %w", err)
 		}
@@ -202,12 +203,13 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 }
 
 // creates/updates the job (by deleting/recreating) and returns it for inspection
-func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime.Object) error {
+func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, incomingObject runtime.Object) error {
 	ctx := context.Background()
 
 	cpString := string(cp)
 
 	var job *gocron.Job
+	var err error
 
 	// if 5 fields, regular cron, if 6 fields, cron with seconds, otherwise freak out
 	var cronFunc func(string) *gocron.Scheduler
@@ -234,10 +236,8 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 
 	tag := fmt.Sprintf("%s--%s", ri, cp)
 
-	var err error
-
 	scheduler := cronFunc(cpString)
-	job, err = scheduler.Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj)
+	job, err = scheduler.Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, incomingObject)
 	if err != nil {
 		return fmt.Errorf("error in createJob during creation: %w", err)
 	}
@@ -251,6 +251,95 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 
 	(*registeredJobsForResource)[cp] = job
+
+	om, _ := getObjectMetaAndKind(incomingObject)
+	namespace := om.GetNamespace()
+	name := om.GetName()
+
+	if err != nil {
+		s.logger.Error("error getting object in createJob", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
+		return err
+	}
+
+	// for DaemonSets/StatefulSets, the type of the ownerref in the pod is DS/STS and the name is the name of the DS/STS
+	// for Deployments, there is an additional layer of indirection via the ReplicaSet, and so we must find the right RS
+	ownerRefKind := ""
+	ownerRefName := ""
+
+	switch incomingObject.(type) {
+	case *appsv1.DaemonSet:
+		ownerRefKind = "DaemonSet"
+		ownerRefName = name
+	case *appsv1.Deployment:
+		ownerRefKind = "ReplicaSet"
+
+		rsets, _ := s.clientset.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+
+		var latestGenerationFound int64 = 0
+		for _, rset := range rsets.Items {
+			for _, oref := range rset.OwnerReferences {
+				if oref.Kind == "Deployment" && oref.Name == name && rset.Generation > latestGenerationFound {
+					ownerRefName = rset.Name
+					latestGenerationFound = rset.Generation
+				}
+			}
+		}
+		if latestGenerationFound == 0 {
+			s.logger.Error("did not find any ReplicaSet owned by this Deployment, cannot update status of pods", zap.String("name", name))
+		}
+	case *appsv1.StatefulSet:
+		ownerRefKind = "StatefulSet"
+		ownerRefName = name
+	}
+
+	s.logger.Debug("ownerref we're looking for", zap.String("referent", name), zap.String("kind", ownerRefKind), zap.String("name", ownerRefName))
+
+	pods, err := s.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	filteredPods := []corev1.Pod{}
+	for _, pod := range pods.Items {
+		for _, oref := range pod.OwnerReferences {
+			if oref.Kind == ownerRefKind && oref.Name == ownerRefName {
+				filteredPods = append(filteredPods, pod)
+				break
+			}
+		}
+	}
+
+	for _, pod := range filteredPods {
+		event := corev1.Event{
+			Count:          1,
+			FirstTimestamp: metav1.Now(),
+			InvolvedObject: corev1.ObjectReference{
+				Kind:            "pod",
+				Namespace:       pod.Namespace,
+				Name:            pod.Name,
+				UID:             pod.UID,
+				APIVersion:      pod.APIVersion,
+				ResourceVersion: pod.ResourceVersion,
+			},
+			LastTimestamp: metav1.Now(),
+			Message:       fmt.Sprintf("Added cron pattern '%s'", cp),
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: pod.Name,
+				Namespace:    namespace,
+			},
+			Reason:              "AddedCronPattern",
+			ReportingController: "kairos",
+			Source: corev1.EventSource{
+				Component: "kairos",
+			},
+			Type: "Normal",
+		}
+
+		_, err = s.clientset.CoreV1().Events(namespace).Create(ctx, &event, metav1.CreateOptions{})
+		if err != nil {
+			s.logger.Error("error creating kairos event", zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
+		}
+	}
 
 	return nil
 }
@@ -268,7 +357,7 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 
 	for cronPattern, job := range *registeredJobsForResource {
-		err := s.deleteJob(cronPattern, ri, job)
+		err := s.deleteJob(cronPattern, ri, job, obj)
 		if err != nil {
 			return err
 		}
@@ -278,7 +367,7 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	return nil
 }
 
-func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job) error {
+func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job, obj runtime.Object) error {
 	err := s.cron.RemoveByID(job)
 	if err != nil {
 		if !errors.Is(err, gocron.ErrJobNotFound) {
