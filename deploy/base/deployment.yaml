@@ -17,7 +17,7 @@ spec:
       serviceAccountName: kairos
       containers:
         - name: kairos
-          image: erhudy/kairos:latest
+          image: erhudy/kairos:dev
           resources:
             limits:
               cpu: 50m

@@ -37,7 +37,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
 
 		err = c.synchronize("default/my-dep")
 		require.NoError(t, err)
@@ -65,7 +65,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
 
 		err = c.synchronize("default/no-cron")
 		require.NoError(t, err)
@@ -88,7 +88,7 @@ func TestSynchronize(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
 
 		// Pre-populate objectMap to simulate that we previously saw this object
 		c.objectMap.Store("default/deleted-dep", dep)
@@ -109,7 +109,7 @@ func TestSynchronize(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan)
 
 		err := c.synchronize("default/nonexistent")
 		require.Error(t, err)
@@ -120,7 +120,7 @@ func TestSynchronize(t *testing.T) {
 	t.Run("indexer returns error", func(t *testing.T) {
 		workchan := make(chan ObjectAndSchedulerAction, 10)
 		fi := &fakeErrorIndexer{err: fmt.Errorf("indexer failure")}
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), fi, nil, &appsv1.Deployment{}, "deployments", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), fi, nil, &appsv1.Deployment{}, "deployments", workchan)
 
 		err := c.synchronize("default/anything")
 		require.Error(t, err)
@@ -145,7 +145,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), indexer, nil, &appsv1.DaemonSet{}, "daemonsets", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.DaemonSet{}, "daemonsets", workchan)
 
 		err = c.synchronize("kube-system/my-ds")
 		require.NoError(t, err)
@@ -173,7 +173,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()), indexer, nil, &appsv1.StatefulSet{}, "statefulsets", workchan)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.StatefulSet{}, "statefulsets", workchan)
 
 		err = c.synchronize("prod/my-ss")
 		require.NoError(t, err)
@@ -190,7 +190,7 @@ func TestHandleErr(t *testing.T) {
 	t.Parallel()
 
 	t.Run("no error forgets the key", func(t *testing.T) {
-		queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 		c := &Controller{
 			logger:    zap.NewNop(),
 			queue:     queue,
@@ -208,7 +208,7 @@ func TestHandleErr(t *testing.T) {
 	})
 
 	t.Run("error with requeues < 5 re-enqueues", func(t *testing.T) {
-		queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 		c := &Controller{
 			logger:    zap.NewNop(),
 			queue:     queue,
@@ -222,7 +222,7 @@ func TestHandleErr(t *testing.T) {
 	})
 
 	t.Run("error with requeues >= 5 drops the item", func(t *testing.T) {
-		queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 		c := &Controller{
 			logger:    zap.NewNop(),
 			queue:     queue,

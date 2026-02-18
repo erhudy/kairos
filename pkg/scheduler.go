@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +36,8 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 		select {
 		case <-stopCh:
 			s.logger.Info("stopping scheduler")
+			s.cron.Stop()
+			return
 		case i := <-s.workchan:
 			s.processSchedulerBundle(i)
 		}
@@ -60,18 +61,16 @@ func (s *Scheduler) ShowJobStatus() {
 				job:         job,
 			})
 		}
-		s.logger.Info(fmt.Sprintf("JOB STATUS FOR '%s'", key))
+		s.logger.Info("job status for resource", zap.Any("resource", key))
 		for _, j := range jobs {
-			lastRunStr := j.job.LastRun().String()
 			nextRun := j.job.NextRun()
-			nextRunStr := nextRun.String()
-			nextRunInStr := time.Until(nextRun).String()
-			s.logger.Info(fmt.Sprintf(" | tags: '%s'", strings.Join(j.job.Tags(), ",")))
-			s.logger.Info(fmt.Sprintf(" | cron pattern: '%s'", j.cronStrings))
-			s.logger.Info(fmt.Sprintf(" | last run: %s", lastRunStr))
-			s.logger.Info(fmt.Sprintf(" | next run: %s", nextRunStr))
-			s.logger.Info(fmt.Sprintf(" | next run in: %s", nextRunInStr))
-			s.logger.Info("------")
+			s.logger.Info("job detail",
+				zap.String("tags", strings.Join(j.job.Tags(), ",")),
+				zap.String("cron-pattern", j.cronStrings.String()),
+				zap.Time("last-run", j.job.LastRun()),
+				zap.Time("next-run", nextRun),
+				zap.Duration("next-run-in", time.Until(nextRun)),
+			)
 		}
 		s.logger.Info("----------------------------------")
 		return true
@@ -223,10 +222,11 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 		expectedCountForCronWithSeconds += 1
 	}
 
-	switch l := len(strings.Split(cpString, " ")); {
-	case l == expectedCountForCron:
+	l := len(strings.Split(cpString, " "))
+	switch l {
+	case expectedCountForCron:
 		cronFunc = s.cron.Cron
-	case l == expectedCountForCronWithSeconds:
+	case expectedCountForCronWithSeconds:
 		cronFunc = s.cron.CronWithSeconds
 	default:
 		return fmt.Errorf("got %d fields splitting cron expression '%s', expected 5 or 6", l, cp)
@@ -306,49 +306,52 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 	om, _ := getObjectMetaAndKind(incomingObject)
 	namespace := om.GetNamespace()
 	name := om.GetName()
-	var obj runtime.Object
+
+	logger.Info("firing restartFunc", zap.Time("time", time.Now()), zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
+
+	now := time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
 	var err error
 
 	switch incomingObject.(type) {
-	case *appsv1.DaemonSet:
-		obj, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
 	case *appsv1.Deployment:
-		obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		obj, getErr := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
+			return
+		}
+		if obj.Spec.Template.Annotations == nil {
+			obj.Spec.Template.Annotations = make(map[string]string)
+		}
+		obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
+		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+	case *appsv1.DaemonSet:
+		obj, getErr := clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
+			return
+		}
+		if obj.Spec.Template.Annotations == nil {
+			obj.Spec.Template.Annotations = make(map[string]string)
+		}
+		obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
+		_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	case *appsv1.StatefulSet:
-		obj, err = clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		obj, getErr := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if getErr != nil {
+			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
+			return
+		}
+		if obj.Spec.Template.Annotations == nil {
+			obj.Spec.Template.Annotations = make(map[string]string)
+		}
+		obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
+		_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	default:
-		panic(fmt.Errorf("panicked in restartFunc because got type %T", incomingObject))
-	}
-
-	logger.Info("firing restartFunc", zap.Time("time", time.Now()), zap.String("type", fmt.Sprintf("%T", obj)), zap.String("namespace", namespace), zap.String("name", name))
-
-	if err != nil {
-		logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", obj)), zap.String("namespace", namespace), zap.String("name", name))
+		logger.Error("unsupported type in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)))
 		return
 	}
 
-	template := reflect.Indirect(reflect.ValueOf(obj)).FieldByName("Spec").FieldByName("Template")
-	annotations := template.FieldByName("Annotations").Interface().(map[string]string)
-
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-	annotations[CRON_LAST_RESTARTED_AT_KEY] = time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
-	template.FieldByName("Annotations").Set(reflect.ValueOf(annotations))
-
-	switch incomingObject.(type) {
-	case *appsv1.DaemonSet:
-		_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj.(*appsv1.DaemonSet), metav1.UpdateOptions{})
-	case *appsv1.Deployment:
-		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj.(*appsv1.Deployment), metav1.UpdateOptions{})
-	case *appsv1.StatefulSet:
-		_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj.(*appsv1.StatefulSet), metav1.UpdateOptions{})
-	default:
-		panic(fmt.Errorf("panicked in restartFunc because got type %T", incomingObject))
-	}
-
 	if err != nil {
-		logger.Error("error updating object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
-		return
+		logger.Error("error updating object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
 	}
 }

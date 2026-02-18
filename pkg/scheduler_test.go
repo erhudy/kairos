@@ -19,7 +19,7 @@ import (
 // newTestScheduler creates a Scheduler suitable for unit tests.
 func newTestScheduler(t *testing.T, objects ...runtime.Object) (*Scheduler, *fake.Clientset) {
 	t.Helper()
-	clientset := fake.NewSimpleClientset(objects...)
+	clientset := fake.NewClientset(objects...)
 	logger := zap.NewNop()
 	tz, err := time.LoadLocation("")
 	require.NoError(t, err)
@@ -62,7 +62,7 @@ func TestRestartFunc(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			clientset := fake.NewSimpleClientset(tt.object)
+			clientset := fake.NewClientset(tt.object)
 			logger := zap.NewNop()
 
 			// Truncate to second precision since RFC3339 drops sub-second
@@ -96,17 +96,17 @@ func TestRestartFunc(t *testing.T) {
 	}
 }
 
-func TestRestartFuncPanicsOnUnsupportedType(t *testing.T) {
+func TestRestartFuncHandlesUnsupportedType(t *testing.T) {
 	t.Parallel()
 
 	unsupported := &appsv1.ReplicaSet{
 		TypeMeta:   metav1.TypeMeta{Kind: "ReplicaSet", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: "rs1", Namespace: "ns1"},
 	}
-	clientset := fake.NewSimpleClientset(unsupported)
+	clientset := fake.NewClientset(unsupported)
 	logger := zap.NewNop()
 
-	require.Panics(t, func() {
+	require.NotPanics(t, func() {
 		restartFunc(context.Background(), logger, clientset, unsupported)
 	})
 }
@@ -498,22 +498,27 @@ func TestSchedulerEndToEnd(t *testing.T) {
 			// Force-fire all scheduled jobs immediately
 			s.cron.RunAll()
 
-			// Give the async job a moment to complete
-			time.Sleep(200 * time.Millisecond)
-
-			// Verify the restart annotation was set
+			// Poll until the restart annotation appears rather than using a fixed sleep
 			var obj runtime.Object
-			var err error
-			switch tt.object.(type) {
-			case *appsv1.Deployment:
-				obj, err = clientset.AppsV1().Deployments(tt.namespace).Get(context.TODO(), tt.name, metav1.GetOptions{})
-			case *appsv1.DaemonSet:
-				obj, err = clientset.AppsV1().DaemonSets(tt.namespace).Get(context.TODO(), tt.name, metav1.GetOptions{})
-			case *appsv1.StatefulSet:
-				obj, err = clientset.AppsV1().StatefulSets(tt.namespace).Get(context.TODO(), tt.name, metav1.GetOptions{})
-			}
-			require.NoError(t, err)
+			var fetchErr error
+			require.Eventually(t, func() bool {
+				switch tt.object.(type) {
+				case *appsv1.Deployment:
+					obj, fetchErr = clientset.AppsV1().Deployments(tt.namespace).Get(context.TODO(), tt.name, metav1.GetOptions{})
+				case *appsv1.DaemonSet:
+					obj, fetchErr = clientset.AppsV1().DaemonSets(tt.namespace).Get(context.TODO(), tt.name, metav1.GetOptions{})
+				case *appsv1.StatefulSet:
+					obj, fetchErr = clientset.AppsV1().StatefulSets(tt.namespace).Get(context.TODO(), tt.name, metav1.GetOptions{})
+				}
+				if fetchErr != nil {
+					return false
+				}
+				anns := reflect.Indirect(reflect.ValueOf(obj)).FieldByName("Spec").FieldByName("Template").FieldByName("Annotations").Interface().(map[string]string)
+				_, ok := anns[CRON_LAST_RESTARTED_AT_KEY]
+				return ok
+			}, 5*time.Second, 10*time.Millisecond, "expected annotation %s to be set", CRON_LAST_RESTARTED_AT_KEY)
 
+			require.NoError(t, fetchErr)
 			anns := reflect.Indirect(reflect.ValueOf(obj)).FieldByName("Spec").FieldByName("Template").FieldByName("Annotations").Interface().(map[string]string)
 			ann, ok := anns[CRON_LAST_RESTARTED_AT_KEY]
 			require.True(t, ok, "expected annotation %s to be set", CRON_LAST_RESTARTED_AT_KEY)

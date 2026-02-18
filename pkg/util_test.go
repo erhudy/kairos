@@ -3,12 +3,24 @@ package pkg
 import (
 	"testing"
 
-	"github.com/erhudy/kairos/kairostest"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// quick and dirty implementation of the runtime.Object interface that does not
+// include the schema.ObjectKind interface (to cause a panic on the type assertion)
+type GetObjectMetaAndKindPanicType struct{}
+
+func (p GetObjectMetaAndKindPanicType) GetObjectKind() schema.ObjectKind {
+	return schema.EmptyObjectKind
+}
+
+func (p GetObjectMetaAndKindPanicType) DeepCopyObject() runtime.Object {
+	return &runtime.Unknown{}
+}
 
 func TestCareAboutThisObject(t *testing.T) {
 	t.Parallel()
@@ -185,7 +197,7 @@ func TestGetObjectMetaAndKind(t *testing.T) {
 		{
 			testName:    "expect panic",
 			expectPanic: true,
-			object:      &kairostest.GetObjectMetaAndKindPanicType{},
+			object:      &GetObjectMetaAndKindPanicType{},
 		},
 	}
 
