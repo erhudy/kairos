@@ -15,8 +15,8 @@ import (
 // Controller demonstrates how to implement a controller with client-go.
 type Controller struct {
 	logger       *zap.Logger
-	indexer      cache.Indexer
-	queue        workqueue.RateLimitingInterface
+	indexer      cache.Store
+	queue        workqueue.TypedRateLimitingInterface[string]
 	informer     cache.Controller
 	typespecimen runtime.Object
 	typename     string

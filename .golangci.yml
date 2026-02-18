@@ -1,8 +1,9 @@
+version: "2"
+
 linters:
   enable:
     - errcheck
     - govet
     - staticcheck
-    - gosimple
     - ineffassign
     - unparam

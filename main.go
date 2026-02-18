@@ -52,7 +52,7 @@ func main() {
 	} else {
 		logger, _ = zap.NewProduction()
 	}
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	timezone, err := time.LoadLocation(tzstring)
 	if err != nil {

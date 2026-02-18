@@ -18,7 +18,7 @@ import (
 )
 
 // NewController creates a new Controller.
-func NewController(logger *zap.Logger, queue workqueue.RateLimitingInterface, indexer cache.Indexer, informer cache.Controller, typespecimen runtime.Object, typename string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func NewController(logger *zap.Logger, queue workqueue.TypedRateLimitingInterface[string], indexer cache.Store, informer cache.Controller, typespecimen runtime.Object, typename string, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	return &Controller{
 		logger:       logger,
 		informer:     informer,
@@ -43,14 +43,14 @@ func (c *Controller) processNextItem() bool {
 	defer c.queue.Done(key)
 
 	// Invoke the method containing the business logic
-	err := c.synchronize(key.(string))
+	err := c.synchronize(key)
 	// Handle the error if something went wrong during the execution of the business logic
 	c.handleErr(err, key)
 	return true
 }
 
 // handleErr checks if an error happened and makes sure we will retry later.
-func (c *Controller) handleErr(err error, key interface{}) {
+func (c *Controller) handleErr(err error, key string) {
 	if err == nil {
 		// Forget about the #AddRateLimited history of the key on every successful synchronization.
 		// This ensures that future processing of updates for this key is not delayed because of
@@ -118,41 +118,46 @@ func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Inte
 
 func generateGenericController(logger *zap.Logger, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
 	watcher := cache.NewListWatchFromClient(restclient, typename, namespace, fields.Everything())
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 
-	indexer, informer := cache.NewIndexerInformer(watcher, typespecimen, 0, cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(obj)
-			if err == nil {
-				queue.Add(key)
-				logger.Debug("added object to add queue", zap.String("key", key))
-			} else {
-				logger.Error("error adding object to add queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
-			}
+	store, informer := cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: watcher,
+		ObjectType:    typespecimen,
+		Handler: cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				key, err := cache.MetaNamespaceKeyFunc(obj)
+				if err == nil {
+					queue.Add(key)
+					logger.Debug("added object to add queue", zap.String("key", key))
+				} else {
+					logger.Error("error adding object to add queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
+				}
+			},
+			UpdateFunc: func(old interface{}, new interface{}) {
+				key, err := cache.MetaNamespaceKeyFunc(new)
+				if err == nil {
+					queue.Add(key)
+					logger.Debug("added object to update queue", zap.String("key", key))
+				} else {
+					logger.Error("error adding object to update queue", zap.Any("obj", new), zap.String("key", key), zap.Error(err))
+				}
+
+			},
+			DeleteFunc: func(obj interface{}) {
+				// InformerWithOptions uses a delta queue, therefore for deletes we have to use this
+				// key function.
+				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+				if err == nil {
+					queue.Add(key)
+					logger.Debug("added object to delete queue", zap.String("key", key))
+				} else {
+					logger.Error("error adding object to delete queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
+				}
+
+			},
 		},
-		UpdateFunc: func(old interface{}, new interface{}) {
-			key, err := cache.MetaNamespaceKeyFunc(new)
-			if err == nil {
-				queue.Add(key)
-				logger.Debug("added object to update queue", zap.String("key", key))
-			} else {
-				logger.Error("error adding object to update queue", zap.Any("obj", new), zap.String("key", key), zap.Error(err))
-			}
+		Indexers: cache.Indexers{},
+	})
 
-		},
-		DeleteFunc: func(obj interface{}) {
-			// IndexerInformer uses a delta queue, therefore for deletes we have to use this
-			// key function.
-			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-			if err == nil {
-				queue.Add(key)
-				logger.Debug("added object to delete queue", zap.String("key", key))
-			} else {
-				logger.Error("error adding object to delete queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
-			}
-
-		},
-	}, cache.Indexers{})
-
-	return NewController(logger, queue, indexer, informer, typespecimen, typename, workchan)
+	return NewController(logger, queue, store, informer, typespecimen, typename, workchan)
 }

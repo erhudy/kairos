@@ -19,7 +19,7 @@ import (
 // newTestScheduler creates a Scheduler suitable for unit tests.
 func newTestScheduler(t *testing.T, objects ...runtime.Object) (*Scheduler, *fake.Clientset) {
 	t.Helper()
-	clientset := fake.NewSimpleClientset(objects...)
+	clientset := fake.NewClientset(objects...)
 	logger := zap.NewNop()
 	tz, err := time.LoadLocation("")
 	require.NoError(t, err)
@@ -62,7 +62,7 @@ func TestRestartFunc(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			clientset := fake.NewSimpleClientset(tt.object)
+			clientset := fake.NewClientset(tt.object)
 			logger := zap.NewNop()
 
 			// Truncate to second precision since RFC3339 drops sub-second
@@ -103,7 +103,7 @@ func TestRestartFuncHandlesUnsupportedType(t *testing.T) {
 		TypeMeta:   metav1.TypeMeta{Kind: "ReplicaSet", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: "rs1", Namespace: "ns1"},
 	}
-	clientset := fake.NewSimpleClientset(unsupported)
+	clientset := fake.NewClientset(unsupported)
 	logger := zap.NewNop()
 
 	require.NotPanics(t, func() {

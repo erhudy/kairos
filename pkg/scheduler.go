@@ -222,10 +222,11 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 		expectedCountForCronWithSeconds += 1
 	}
 
-	switch l := len(strings.Split(cpString, " ")); {
-	case l == expectedCountForCron:
+	l := len(strings.Split(cpString, " "))
+	switch l {
+	case expectedCountForCron:
 		cronFunc = s.cron.Cron
-	case l == expectedCountForCronWithSeconds:
+	case expectedCountForCronWithSeconds:
 		cronFunc = s.cron.CronWithSeconds
 	default:
 		return fmt.Errorf("got %d fields splitting cron expression '%s', expected 5 or 6", l, cp)
