@@ -2,7 +2,6 @@ FROM golang:1.25.7 AS builder
 
 WORKDIR /build
 
-COPY kairostest /build/kairostest
 COPY pkg /build/pkg
 
 COPY main.go /build/
