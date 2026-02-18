@@ -42,7 +42,7 @@ func (c *Controller) synchronize(key string) error {
 		case *appsv1.StatefulSet:
 			objk.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "StatefulSet"})
 		default:
-			panic(fmt.Errorf("got object of type %t in synchronize which should be impossible", obj))
+			return fmt.Errorf("got object of type %T in synchronize which should be impossible", obj)
 		}
 
 		// stash the runtime object in the object map so that we can pull it back out at delete time,

@@ -125,7 +125,7 @@ func generateGenericController(logger *zap.Logger, restclient rest.Interface, na
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(key)
-				logger.Info("added object to add queue", zap.String("key", key))
+				logger.Debug("added object to add queue", zap.String("key", key))
 			} else {
 				logger.Error("error adding object to add queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
 			}
@@ -134,7 +134,7 @@ func generateGenericController(logger *zap.Logger, restclient rest.Interface, na
 			key, err := cache.MetaNamespaceKeyFunc(new)
 			if err == nil {
 				queue.Add(key)
-				logger.Info("added object to update queue", zap.String("key", key))
+				logger.Debug("added object to update queue", zap.String("key", key))
 			} else {
 				logger.Error("error adding object to update queue", zap.Any("obj", new), zap.String("key", key), zap.Error(err))
 			}
@@ -146,7 +146,7 @@ func generateGenericController(logger *zap.Logger, restclient rest.Interface, na
 			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 			if err == nil {
 				queue.Add(key)
-				logger.Info("added object to delete queue", zap.String("key", key))
+				logger.Debug("added object to delete queue", zap.String("key", key))
 			} else {
 				logger.Error("error adding object to delete queue", zap.Any("obj", obj), zap.String("key", key), zap.Error(err))
 			}
