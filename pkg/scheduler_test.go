@@ -24,7 +24,7 @@ func newTestScheduler(t *testing.T, objects ...runtime.Object) (*Scheduler, *fak
 	tz, err := time.LoadLocation("")
 	require.NoError(t, err)
 	ch := make(chan ObjectAndSchedulerAction, 10)
-	s := NewScheduler(tz, logger, ch, clientset)
+	s := NewScheduler(tz, logger, ch, clientset, nil)
 	return s, clientset
 }
 
@@ -67,7 +67,7 @@ func TestRestartFunc(t *testing.T) {
 
 			// Truncate to second precision since RFC3339 drops sub-second
 			startTime := time.Now().Truncate(time.Second)
-			restartFunc(context.Background(), logger, clientset, tt.object)
+			restartFunc(context.Background(), logger, clientset, tt.object, nil)
 
 			// Retrieve the object and verify the annotation was set
 			var obj runtime.Object
@@ -107,7 +107,7 @@ func TestRestartFuncHandlesUnsupportedType(t *testing.T) {
 	logger := zap.NewNop()
 
 	require.NotPanics(t, func() {
-		restartFunc(context.Background(), logger, clientset, unsupported)
+		restartFunc(context.Background(), logger, clientset, unsupported, nil)
 	})
 }
 
