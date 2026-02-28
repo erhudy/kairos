@@ -18,7 +18,7 @@ import (
 )
 
 // NewController creates a new Controller.
-func NewController(logger *zap.Logger, queue workqueue.TypedRateLimitingInterface[string], indexer cache.Store, informer cache.Controller, typespecimen runtime.Object, typename string, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func NewController(logger *zap.Logger, queue workqueue.TypedRateLimitingInterface[string], indexer cache.Store, informer cache.Controller, typespecimen runtime.Object, typename string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
 	return &Controller{
 		logger:       logger,
 		informer:     informer,
@@ -28,6 +28,7 @@ func NewController(logger *zap.Logger, queue workqueue.TypedRateLimitingInterfac
 		typename:     typename,
 		workchan:     workchan,
 		objectMap:    &sync.Map{},
+		metrics:      metrics,
 	}
 }
 
@@ -41,6 +42,10 @@ func (c *Controller) processNextItem() bool {
 	// This allows safe parallel processing because two pods with the same key are never processed in
 	// parallel.
 	defer c.queue.Done(key)
+
+	if c.metrics != nil {
+		c.metrics.QueueDepth.WithLabelValues(c.typename).Set(float64(c.queue.Len()))
+	}
 
 	// Invoke the method containing the business logic
 	err := c.synchronize(key)
@@ -73,6 +78,9 @@ func (c *Controller) handleErr(err error, key string) {
 	// Report to an external entity that, even after several retries, we could not successfully process this key
 	utilruntime.HandleError(err)
 	c.logger.Info("dropping item out of the queue", zap.Any("key", key), zap.Error(err))
+	if c.metrics != nil {
+		c.metrics.SyncErrorsTotal.WithLabelValues(c.typename).Inc()
+	}
 }
 
 // Run begins watching and syncing.
@@ -104,19 +112,19 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func GenerateDeploymentController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan)
+func GenerateDeploymentController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan, metrics)
 }
 
-func GenerateDaemonSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan)
+func GenerateDaemonSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan, metrics)
 }
 
-func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction) *Controller {
-	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan)
+func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan, metrics)
 }
 
-func generateGenericController(logger *zap.Logger, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction) *Controller {
+func generateGenericController(logger *zap.Logger, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
 	watcher := cache.NewListWatchFromClient(restclient, typename, namespace, fields.Everything())
 	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 
@@ -159,5 +167,5 @@ func generateGenericController(logger *zap.Logger, restclient rest.Interface, na
 		Indexers: cache.Indexers{},
 	})
 
-	return NewController(logger, queue, store, informer, typespecimen, typename, workchan)
+	return NewController(logger, queue, store, informer, typespecimen, typename, workchan, metrics)
 }

@@ -20,11 +20,14 @@ package main
 
 import (
 	"flag"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -38,12 +41,14 @@ func main() {
 	var master string
 	var namespace string
 	var tzstring string
+	var metricsAddr string
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&master, "master", "", "master url")
 	flag.StringVar(&namespace, "namespace", "", "namespace")
 	flag.StringVar(&tzstring, "timezone", "Local", "timezone that the scheduler should consider the system clock to be")
+	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "address to serve Prometheus metrics on")
 	flag.Parse()
 
 	var logger *zap.Logger
@@ -76,11 +81,26 @@ func main() {
 		logger.Fatal("unable to build Kubernetes clientset", zap.Error(err))
 	}
 
-	deploymentController := pkg.GenerateDeploymentController(logger, clientset, namespace, workchan)
-	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan)
-	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan)
+	// set up metrics
+	registry := prometheus.NewRegistry()
+	metrics := pkg.NewKairosMetrics()
+	metrics.Register(registry)
 
-	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset)
+	// start metrics HTTP server
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	go func() {
+		logger.Info("starting metrics server", zap.String("addr", metricsAddr))
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			logger.Fatal("metrics server failed", zap.Error(err))
+		}
+	}()
+
+	deploymentController := pkg.GenerateDeploymentController(logger, clientset, namespace, workchan, metrics)
+	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
+	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
+
+	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics)
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGUSR1)
