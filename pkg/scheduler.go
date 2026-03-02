@@ -16,7 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface) *Scheduler {
+func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface, metrics *KairosMetrics) *Scheduler {
 	scheduler := gocron.NewScheduler(timezone)
 	scheduler.TagsUnique()
 
@@ -26,6 +26,7 @@ func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan O
 		cron:        scheduler,
 		clientset:   clientset,
 		resourceMap: &sync.Map{},
+		metrics:     metrics,
 	}
 }
 
@@ -191,7 +192,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	}
 	for _, p := range patternsToDelete {
 		job := (*registeredJobsForResource)[p]
-		err := s.deleteJob(p, ri, job)
+		err := s.deleteJob(p, ri, job, obj)
 		if err != nil {
 			return fmt.Errorf("error while deleting job during reconcile: %w", err)
 		}
@@ -237,7 +238,7 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 	var err error
 
 	scheduler := cronFunc(cpString)
-	job, err = scheduler.Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj)
+	job, err = scheduler.Tag(string(tag)).Do(restartFunc, ctx, s.logger, s.clientset, obj, s.metrics)
 	if err != nil {
 		return fmt.Errorf("error in createJob during creation: %w", err)
 	}
@@ -247,10 +248,17 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 		tempMap := make(map[cronPattern]*gocron.Job)
 		s.resourceMap.Store(ri, &tempMap)
 		registeredJobsForResourceRaw = &tempMap
+		if s.metrics != nil {
+			s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Inc()
+		}
 	}
 	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 
 	(*registeredJobsForResource)[cp] = job
+
+	if s.metrics != nil {
+		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Inc()
+	}
 
 	return nil
 }
@@ -268,17 +276,20 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
 
 	for cronPattern, job := range *registeredJobsForResource {
-		err := s.deleteJob(cronPattern, ri, job)
+		err := s.deleteJob(cronPattern, ri, job, obj)
 		if err != nil {
 			return err
 		}
 	}
 
 	s.resourceMap.Delete(ri)
+	if s.metrics != nil {
+		s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Dec()
+	}
 	return nil
 }
 
-func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job) error {
+func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job, obj runtime.Object) error {
 	err := s.cron.RemoveByID(job)
 	if err != nil {
 		if !errors.Is(err, gocron.ErrJobNotFound) {
@@ -296,20 +307,25 @@ func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron
 			zap.String("resource", string(ri)),
 			zap.String("cron-pattern", string(cp)),
 		)
+		if s.metrics != nil {
+			s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Dec()
+		}
 	}
 	return nil
 }
 
-func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, incomingObject runtime.Object) {
+func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, incomingObject runtime.Object, metrics *KairosMetrics) {
 	logger.Debug("entering restartFunc")
 
 	om, _ := getObjectMetaAndKind(incomingObject)
 	namespace := om.GetNamespace()
 	name := om.GetName()
+	kind := kindFromObject(incomingObject)
 
 	logger.Info("firing restartFunc", zap.Time("time", time.Now()), zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
 
-	now := time.Now().Format(LAST_RESTARTED_AT_TIME_FORMAT)
+	start := time.Now()
+	now := start.Format(LAST_RESTARTED_AT_TIME_FORMAT)
 	var err error
 
 	switch incomingObject.(type) {
@@ -317,6 +333,9 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 		obj, getErr := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
+			if metrics != nil {
+				metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+			}
 			return
 		}
 		if obj.Spec.Template.Annotations == nil {
@@ -328,6 +347,9 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 		obj, getErr := clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
+			if metrics != nil {
+				metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+			}
 			return
 		}
 		if obj.Spec.Template.Annotations == nil {
@@ -339,6 +361,9 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 		obj, getErr := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if getErr != nil {
 			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
+			if metrics != nil {
+				metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+			}
 			return
 		}
 		if obj.Spec.Template.Annotations == nil {
@@ -351,7 +376,18 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 		return
 	}
 
+	if metrics != nil {
+		metrics.RestartDuration.WithLabelValues(kind, namespace, name).Observe(time.Since(start).Seconds())
+	}
+
 	if err != nil {
 		logger.Error("error updating object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
+		if metrics != nil {
+			metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "update").Inc()
+		}
+	} else {
+		if metrics != nil {
+			metrics.RestartTotal.WithLabelValues(kind, namespace, name).Inc()
+		}
 	}
 }

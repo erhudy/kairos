@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -29,4 +30,17 @@ func getObjectMetaAndKind(o runtime.Object) (metav1.Object, schema.ObjectKind) {
 
 func getResourceIdentifier(om metav1.Object, ok schema.ObjectKind) resourceIdentifier {
 	return resourceIdentifier(fmt.Sprintf("%s/%s/%s", ok.GroupVersionKind(), om.GetNamespace(), om.GetName()))
+}
+
+func kindFromObject(obj runtime.Object) string {
+	switch obj.(type) {
+	case *appsv1.Deployment:
+		return "Deployment"
+	case *appsv1.DaemonSet:
+		return "DaemonSet"
+	case *appsv1.StatefulSet:
+		return "StatefulSet"
+	default:
+		return "Unknown"
+	}
 }

@@ -22,6 +22,7 @@ type Controller struct {
 	typename     string
 	workchan     chan<- ObjectAndSchedulerAction
 	objectMap    *sync.Map
+	metrics      *KairosMetrics
 }
 
 type cronPattern string
@@ -48,6 +49,7 @@ type Scheduler struct {
 	cron        *gocron.Scheduler
 	clientset   kubernetes.Interface
 	resourceMap *sync.Map
+	metrics     *KairosMetrics
 }
 
 type SchedulerAction int
