@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-co-op/gocron"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -200,14 +199,14 @@ func TestReconcileJobsForResource(t *testing.T) {
 				// Either no entry or an empty map
 				raw, loaded := s.resourceMap.Load(ri)
 				if loaded {
-					m := raw.(*map[cronPattern]*gocron.Job)
-					require.Empty(t, *m)
+					m := raw.(*resourceMapEntry)
+					require.Empty(t, m.jobs)
 				}
 			} else {
 				raw, loaded := s.resourceMap.Load(ri)
 				require.True(t, loaded)
-				m := raw.(*map[cronPattern]*gocron.Job)
-				require.Len(t, *m, tt.expectedJobsLen)
+				m := raw.(*resourceMapEntry)
+				require.Len(t, m.jobs, tt.expectedJobsLen)
 			}
 		})
 	}
@@ -238,8 +237,8 @@ func TestReconcileJobsPatternChange(t *testing.T) {
 	ri := getResourceIdentifier(om, ok)
 	raw, loaded := s.resourceMap.Load(ri)
 	require.True(t, loaded)
-	m := raw.(*map[cronPattern]*gocron.Job)
-	require.Len(t, *m, 2)
+	m := raw.(*resourceMapEntry)
+	require.Len(t, m.jobs, 2)
 
 	// Modify annotation: remove one, add one
 	dep.Annotations[CRON_PATTERN_KEY] = "0 0 * * *;15 18 * * *"
@@ -248,12 +247,12 @@ func TestReconcileJobsPatternChange(t *testing.T) {
 
 	raw, loaded = s.resourceMap.Load(ri)
 	require.True(t, loaded)
-	m = raw.(*map[cronPattern]*gocron.Job)
-	require.Len(t, *m, 2)
+	m = raw.(*resourceMapEntry)
+	require.Len(t, m.jobs, 2)
 	// Should have "0 0 * * *" (unchanged) and "15 18 * * *" (new), but not "30 6 * * *"
-	_, has00 := (*m)[cronPattern("0 0 * * *")]
-	_, has1518 := (*m)[cronPattern("15 18 * * *")]
-	_, has306 := (*m)[cronPattern("30 6 * * *")]
+	_, has00 := m.jobs[cronPattern("0 0 * * *")]
+	_, has1518 := m.jobs[cronPattern("15 18 * * *")]
+	_, has306 := m.jobs[cronPattern("30 6 * * *")]
 	require.True(t, has00, "expected pattern '0 0 * * *' to still exist")
 	require.True(t, has1518, "expected pattern '15 18 * * *' to be added")
 	require.False(t, has306, "expected pattern '30 6 * * *' to be removed")
@@ -328,8 +327,8 @@ func TestCreateJob(t *testing.T) {
 				require.NoError(t, err)
 				raw, loaded := s.resourceMap.Load(ri)
 				require.True(t, loaded)
-				m := raw.(*map[cronPattern]*gocron.Job)
-				_, exists := (*m)[tt.pattern]
+				m := raw.(*resourceMapEntry)
+				_, exists := m.jobs[tt.pattern]
 				require.True(t, exists, "expected job to be stored for pattern %s", tt.pattern)
 			}
 		})
@@ -366,8 +365,8 @@ func TestDeleteJobsForResource(t *testing.T) {
 
 		raw, loaded := s.resourceMap.Load(ri)
 		require.True(t, loaded)
-		m := raw.(*map[cronPattern]*gocron.Job)
-		require.Len(t, *m, 2)
+		m := raw.(*resourceMapEntry)
+		require.Len(t, m.jobs, 2)
 
 		// Now delete all jobs
 		err = s.deleteJobsForResource(dep)
@@ -416,8 +415,8 @@ func TestProcessSchedulerBundle(t *testing.T) {
 		ri := getResourceIdentifier(om, ok)
 		raw, loaded := s.resourceMap.Load(ri)
 		require.True(t, loaded)
-		m := raw.(*map[cronPattern]*gocron.Job)
-		require.Len(t, *m, 1)
+		m := raw.(*resourceMapEntry)
+		require.Len(t, m.jobs, 1)
 	})
 
 	t.Run("RESOURCE_DELETE dispatches to delete", func(t *testing.T) {

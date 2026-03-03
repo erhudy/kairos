@@ -17,6 +17,9 @@ go test -v ./...
 # Run a single test
 go test -v ./pkg -run TestRestartFunc
 
+# Lint
+golangci-lint run
+
 # Run locally against a cluster (kubeconfig required)
 go run main.go -kubeconfig ~/.kube/config
 ```

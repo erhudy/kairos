@@ -21,9 +21,6 @@ package main
 import (
 	"flag"
 	"net/http"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -86,27 +83,21 @@ func main() {
 	metrics := pkg.NewKairosMetrics()
 	metrics.Register(registry)
 
-	// start metrics HTTP server
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-	go func() {
-		logger.Info("starting metrics server", zap.String("addr", metricsAddr))
-		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
-			logger.Fatal("metrics server failed", zap.Error(err))
-		}
-	}()
-
 	deploymentController := pkg.GenerateDeploymentController(logger, clientset, namespace, workchan, metrics)
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
 
 	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics)
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGUSR1)
+	// start HTTP server (metrics + web UI)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("/api/jobs", scheduler.JobStatusJSON)
+	mux.HandleFunc("/", scheduler.JobStatusPage)
 	go func() {
-		for range signalChan {
-			scheduler.ShowJobStatus()
+		logger.Info("starting HTTP server", zap.String("addr", metricsAddr))
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			logger.Fatal("HTTP server failed", zap.Error(err))
 		}
 	}()
 
