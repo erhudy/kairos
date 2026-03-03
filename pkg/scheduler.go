@@ -2,8 +2,12 @@ package pkg
 
 import (
 	"context"
+	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,37 +49,49 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 	}
 }
 
-func (s *Scheduler) ShowJobStatus() {
-	s.logger.Info("got signal to dump job status")
+type jobStatusEntry struct {
+	Resource     string `json:"resource"`
+	CronPattern string `json:"cronPattern"`
+	LastRun      string `json:"lastRun"`
+	NextRun      string `json:"nextRun"`
+}
+
+func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
+	var entries []jobStatusEntry
+
 	s.resourceMap.Range(func(key, value any) bool {
-		valueAsserted := value.(*map[cronPattern]*gocron.Job)
-		jobs := []struct {
-			cronStrings cronPattern
-			job         *gocron.Job
-		}{}
-		for cp, job := range *valueAsserted {
-			jobs = append(jobs, struct {
-				cronStrings cronPattern
-				job         *gocron.Job
-			}{
-				cronStrings: cp,
-				job:         job,
+		ri := key.(resourceIdentifier)
+		entry := value.(*resourceMapEntry)
+		for cp, job := range entry.jobs {
+			lastRunStr := getPodTemplateAnnotation(entry.obj, CRON_LAST_RESTARTED_AT_KEY)
+			entries = append(entries, jobStatusEntry{
+				Resource:     string(ri),
+				CronPattern:  string(cp),
+				LastRun:      lastRunStr,
+				NextRun:      job.NextRun().UTC().Format(time.RFC3339),
 			})
 		}
-		s.logger.Info("job status for resource", zap.Any("resource", key))
-		for _, j := range jobs {
-			nextRun := j.job.NextRun()
-			s.logger.Info("job detail",
-				zap.String("tags", strings.Join(j.job.Tags(), ",")),
-				zap.String("cron-pattern", j.cronStrings.String()),
-				zap.Time("last-run", j.job.LastRun()),
-				zap.Time("next-run", nextRun),
-				zap.Duration("next-run-in", time.Until(nextRun)),
-			)
-		}
-		s.logger.Info("----------------------------------")
 		return true
 	})
+
+	if entries == nil {
+		entries = []jobStatusEntry{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(entries); err != nil {
+		s.logger.Error("error encoding job status JSON", zap.Error(err))
+	}
+}
+
+//go:embed job_status.html
+var jobStatusPageHTML string
+
+func (s *Scheduler) JobStatusPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if _, err := w.Write([]byte(jobStatusPageHTML)); err != nil {
+		s.logger.Error("error writing job status page", zap.Error(err))
+	}
 }
 
 func (s *Scheduler) processSchedulerBundle(action ObjectAndSchedulerAction) {
@@ -117,12 +133,16 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	cronPatternsFromMap := cronPatterns{}
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
-		tempMap := make(map[cronPattern]*gocron.Job)
-		s.resourceMap.Store(ri, &tempMap)
-		registeredJobsForResourceRaw = &tempMap
+		entry := &resourceMapEntry{
+			obj:  obj,
+			jobs: make(map[cronPattern]*gocron.Job),
+		}
+		s.resourceMap.Store(ri, entry)
+		registeredJobsForResourceRaw = entry
 	}
-	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
-	for pattern := range *registeredJobsForResource {
+	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+	entry.obj = obj
+	for pattern := range entry.jobs {
 		cronPatternsFromMap = append(cronPatternsFromMap, pattern)
 	}
 
@@ -135,14 +155,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 
 	// if the pattern is in our map, but is not on the resource, it has been removed and so we delete the restart job
 	for _, i := range cronPatternsFromMap {
-		found := false
-		for _, j := range cronPatternsFromResource {
-			if i == j {
-				found = true
-				break
-			}
-		}
-		if found {
+		if slices.Contains(cronPatternsFromResource, i) {
 			patternsThatDidNotChangeMap[i] = struct{}{}
 		} else {
 			if i.String() != "" {
@@ -153,14 +166,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 
 	// if the pattern is on the resource, but is not in our map, it is a new pattern and so we need to make a restart job
 	for _, i := range cronPatternsFromResource {
-		found := false
-		for _, j := range cronPatternsFromMap {
-			if i == j {
-				found = true
-				break
-			}
-		}
-		if found {
+		if slices.Contains(cronPatternsFromMap, i) {
 			patternsThatDidNotChangeMap[i] = struct{}{}
 		} else {
 			if i.String() != "" {
@@ -191,7 +197,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		}
 	}
 	for _, p := range patternsToDelete {
-		job := (*registeredJobsForResource)[p]
+		job := entry.jobs[p]
 		err := s.deleteJob(p, ri, job, obj)
 		if err != nil {
 			return fmt.Errorf("error while deleting job during reconcile: %w", err)
@@ -245,16 +251,19 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
-		tempMap := make(map[cronPattern]*gocron.Job)
-		s.resourceMap.Store(ri, &tempMap)
-		registeredJobsForResourceRaw = &tempMap
+		entry := &resourceMapEntry{
+			obj:  obj,
+			jobs: make(map[cronPattern]*gocron.Job),
+		}
+		s.resourceMap.Store(ri, entry)
+		registeredJobsForResourceRaw = entry
 		if s.metrics != nil {
 			s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Inc()
 		}
 	}
-	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
+	registeredEntry := registeredJobsForResourceRaw.(*resourceMapEntry)
 
-	(*registeredJobsForResource)[cp] = job
+	registeredEntry.jobs[cp] = job
 
 	if s.metrics != nil {
 		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Inc()
@@ -273,9 +282,9 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	if !ok {
 		return fmt.Errorf("resource %s not found in resource map", ri)
 	}
-	registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
+	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
 
-	for cronPattern, job := range *registeredJobsForResource {
+	for cronPattern, job := range entry.jobs {
 		err := s.deleteJob(cronPattern, ri, job, obj)
 		if err != nil {
 			return err
@@ -300,8 +309,8 @@ func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron
 		if !ok {
 			return fmt.Errorf("resource %s not found in resource map", ri)
 		}
-		registeredJobsForResource := registeredJobsForResourceRaw.(*map[cronPattern]*gocron.Job)
-		delete(*registeredJobsForResource, cp)
+		entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+		delete(entry.jobs, cp)
 		s.logger.Info(
 			"deleted job",
 			zap.String("resource", string(ri)),

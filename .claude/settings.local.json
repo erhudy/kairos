@@ -3,7 +3,10 @@
     "allow": [
       "Bash(wc:*)",
       "Bash(golangci-lint help:*)",
-      "Bash(go list:*)"
+      "Bash(go list:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(golangci-lint run:*)"
     ]
   }
 }

@@ -41,6 +41,11 @@ func (c cronPatterns) String() string {
 	return strings.Join(ss, ", ")
 }
 
+type resourceMapEntry struct {
+	obj  runtime.Object
+	jobs map[cronPattern]*gocron.Job
+}
+
 type resourceIdentifier string
 
 type Scheduler struct {

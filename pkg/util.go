@@ -32,6 +32,19 @@ func getResourceIdentifier(om metav1.Object, ok schema.ObjectKind) resourceIdent
 	return resourceIdentifier(fmt.Sprintf("%s/%s/%s", ok.GroupVersionKind(), om.GetNamespace(), om.GetName()))
 }
 
+func getPodTemplateAnnotation(obj runtime.Object, key string) string {
+	switch o := obj.(type) {
+	case *appsv1.Deployment:
+		return o.Spec.Template.Annotations[key]
+	case *appsv1.DaemonSet:
+		return o.Spec.Template.Annotations[key]
+	case *appsv1.StatefulSet:
+		return o.Spec.Template.Annotations[key]
+	default:
+		return ""
+	}
+}
+
 func kindFromObject(obj runtime.Object) string {
 	switch obj.(type) {
 	case *appsv1.Deployment:
