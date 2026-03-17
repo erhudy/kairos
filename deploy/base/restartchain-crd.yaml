@@ -1,0 +1,170 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: restartchains.kairos.erhudy.com
+spec:
+  group: kairos.erhudy.com
+  names:
+    kind: RestartChain
+    listKind: RestartChainList
+    plural: restartchains
+    singular: restartchain
+    shortNames:
+    - rc
+    - rchain
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    additionalPrinterColumns:
+    - name: Phase
+      type: string
+      jsonPath: .status.phase
+    - name: Last Run
+      type: string
+      format: date-time
+      jsonPath: .status.lastRunTime
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+    subresources:
+      status: {}
+    schema:
+      openAPIV3Schema:
+        type: object
+        description: RestartChain orchestrates sequential restarts of multiple Kubernetes workloads.
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            type: object
+            required:
+            - cronPattern
+            - steps
+            properties:
+              cronPattern:
+                type: string
+                description: Standard 5-field or 6-field (with seconds) cron expression.
+              paused:
+                type: boolean
+                description: Suspends future executions when set to true.
+              steps:
+                type: array
+                minItems: 1
+                description: Ordered sequence of resources to restart.
+                items:
+                  type: object
+                  required:
+                  - resourceRef
+                  properties:
+                    resourceRef:
+                      type: object
+                      required:
+                      - kind
+                      - name
+                      - namespace
+                      properties:
+                        kind:
+                          type: string
+                          enum:
+                          - Deployment
+                          - DaemonSet
+                          - StatefulSet
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                    healthCheck:
+                      type: object
+                      properties:
+                        strategy:
+                          type: string
+                          enum:
+                          - RolloutComplete
+                          - FixedTimeout
+                          - RolloutWithTimeout
+                          default: RolloutComplete
+                        timeoutSeconds:
+                          type: integer
+                          format: int32
+                          default: 600
+                        pollIntervalSeconds:
+                          type: integer
+                          format: int32
+                          default: 5
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+              currentStep:
+                type: integer
+                format: int32
+              lastRunTime:
+                type: string
+                format: date-time
+              lastCompletionTime:
+                type: string
+                format: date-time
+              stepStatuses:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    resourceRef:
+                      type: object
+                      properties:
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                    phase:
+                      type: string
+                    startedAt:
+                      type: string
+                      format: date-time
+                    completedAt:
+                      type: string
+                      format: date-time
+                    message:
+                      type: string
+                    observedGeneration:
+                      type: integer
+                      format: int64
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required:
+                  - type
+                  - status
+                  - lastTransitionTime
+                  - reason
+                  - message
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      type: integer
+                      format: int64

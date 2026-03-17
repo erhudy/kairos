@@ -51,9 +51,7 @@ func TestRestartFuncIncrementsMetrics(t *testing.T) {
 	require.True(t, durationFound, "expected restart duration histogram to have observations")
 
 	// Verify no error counters were incremented
-	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "metric-dep", "get"))
-	require.Equal(t, float64(0), errCount)
-	errCount = testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "metric-dep", "update"))
+	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "metric-dep", "restart"))
 	require.Equal(t, float64(0), errCount)
 }
 
@@ -75,8 +73,8 @@ func TestRestartFuncGetErrorIncrementsErrorMetric(t *testing.T) {
 
 	restartFunc(context.Background(), logger, clientset, dep, metrics)
 
-	// Verify get error counter was incremented
-	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "nonexistent", "get"))
+	// Verify restart error counter was incremented
+	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "nonexistent", "restart"))
 	require.Equal(t, float64(1), errCount)
 
 	// Verify restart counter was NOT incremented

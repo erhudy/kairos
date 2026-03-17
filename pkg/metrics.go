@@ -12,6 +12,9 @@ type KairosMetrics struct {
 	ScheduledJobs        *prometheus.GaugeVec
 	QueueDepth           *prometheus.GaugeVec
 	SyncErrorsTotal      *prometheus.CounterVec
+	ChainExecutionTotal  *prometheus.CounterVec
+	ChainStepDuration    *prometheus.HistogramVec
+	ChainSkippedTotal    *prometheus.CounterVec
 }
 
 func NewKairosMetrics() *KairosMetrics {
@@ -45,6 +48,19 @@ func NewKairosMetrics() *KairosMetrics {
 			Name: "kairos_sync_errors_total",
 			Help: "Total number of sync errors after exhausting retries",
 		}, []string{"kind"}),
+		ChainExecutionTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kairos_chain_execution_total",
+			Help: "Total number of chain executions by outcome",
+		}, []string{"chain", "result"}),
+		ChainStepDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "kairos_chain_step_duration_seconds",
+			Help:    "Duration of individual chain steps in seconds",
+			Buckets: prometheus.ExponentialBuckets(1, 2, 12),
+		}, []string{"chain", "kind", "namespace", "name"}),
+		ChainSkippedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kairos_chain_skipped_total",
+			Help: "Total number of chain triggers skipped because the chain was already running",
+		}, []string{"chain"}),
 	}
 }
 
@@ -57,5 +73,8 @@ func (m *KairosMetrics) Register(reg prometheus.Registerer) {
 		m.ScheduledJobs,
 		m.QueueDepth,
 		m.SyncErrorsTotal,
+		m.ChainExecutionTotal,
+		m.ChainStepDuration,
+		m.ChainSkippedTotal,
 	)
 }

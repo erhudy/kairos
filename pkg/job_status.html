@@ -5,18 +5,35 @@
 <title>Kairos Job Status</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem; background: #f5f5f5; color: #333; }
-  h1 { margin-bottom: 0.5rem; }
+  h1, h2 { margin-bottom: 0.5rem; }
+  h2 { margin-top: 2rem; }
   .status-bar { display: flex; align-items: center; gap: 1rem; color: #888; font-size: 0.85rem; margin-bottom: 1rem; }
   .status-bar .refresh-control { margin-left: auto; }
-  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1rem; }
   th, td { text-align: left; padding: 0.6rem 1rem; border-bottom: 1px solid #eee; }
   th { background: #fafafa; font-weight: 600; }
+  th.sortable { cursor: pointer; user-select: none; position: relative; padding-right: 1.6rem; }
+  th.sortable:hover { background: #f0f0f0; }
+  th.sortable::after { content: "\2195"; position: absolute; right: 0.5rem; color: #ccc; font-size: 0.75rem; }
+  th.sort-asc::after { content: "\25B2"; color: #333; }
+  th.sort-desc::after { content: "\25BC"; color: #333; }
   tr:hover { background: #f9f9f9; }
   .empty { padding: 2rem; text-align: center; color: #888; }
+  .phase { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.8rem; font-weight: 600; }
+  .phase-idle { background: #e0e0e0; color: #555; }
+  .phase-running { background: #bbdefb; color: #1565c0; }
+  .phase-completed { background: #c8e6c9; color: #2e7d32; }
+  .phase-failed { background: #ffcdd2; color: #c62828; }
+  .phase-pending { background: #e0e0e0; color: #555; }
+  .phase-restarting { background: #fff9c4; color: #f57f17; }
+  .phase-waitingforhealthy { background: #bbdefb; color: #1565c0; }
+  .step-list { margin: 0.3rem 0; padding: 0; list-style: none; }
+  .step-list li { padding: 0.2rem 0; font-size: 0.85rem; }
+  .paused { color: #f57f17; font-weight: 600; }
 </style>
 </head>
 <body>
-<h1>Kairos Job Status</h1>
+<h1>Kairos Status</h1>
 <div class="status-bar">
   <span id="updated"></span>
   <span id="countdown"></span>
@@ -34,21 +51,50 @@
     </select>
   </span>
 </div>
-<table>
+
+<h2>Scheduled Jobs</h2>
+<table id="jobs-table">
   <thead>
     <tr>
-      <th>Resource</th>
-      <th>Cron Pattern</th>
-      <th>Last Restart</th>
-      <th>Next Restart</th>
-      <th>Time Until Next Restart</th>
+      <th class="sortable" data-table="jobs" data-col="0">Resource</th>
+      <th class="sortable" data-table="jobs" data-col="1">Cron Pattern</th>
+      <th class="sortable" data-table="jobs" data-col="2">Last Restart</th>
+      <th class="sortable" data-table="jobs" data-col="3">Next Restart</th>
+      <th class="sortable" data-table="jobs" data-col="4">Time Until Next Restart</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
 </table>
+
+<h2>Restart Chains</h2>
+<table id="chains-table">
+  <thead>
+    <tr>
+      <th class="sortable" data-table="chains" data-col="0">Chain</th>
+      <th class="sortable" data-table="chains" data-col="1">Cron Pattern</th>
+      <th class="sortable" data-table="chains" data-col="2">Phase</th>
+      <th class="sortable" data-table="chains" data-col="3">Last Run</th>
+      <th class="sortable" data-table="chains" data-col="4">Last Completion</th>
+      <th>Steps</th>
+    </tr>
+  </thead>
+  <tbody id="chains-tbody"></tbody>
+</table>
+
 <script>
+// --- Sort state ---
+// Each table tracks which column index is sorted and the direction.
+var sortState = {
+  jobs:   { col: 0, asc: true },
+  chains: { col: 0, asc: true }
+};
+
+// Raw data caches so we can re-sort without refetching.
+var jobsData = [];
+var chainsData = [];
+
 function timeUntil(dateStr) {
-  if (!dateStr) return { text: "", overdue: false };
+  if (!dateStr) return { text: "", overdue: false, seconds: 0 };
   var diff = (new Date(dateStr) - new Date()) / 1000;
   var overdue = diff < 0;
   var abs = Math.abs(diff);
@@ -60,34 +106,173 @@ function timeUntil(dateStr) {
   if (m > 0) parts.push(m + "m");
   parts.push(s + "s");
   var text = (overdue ? "-" : "") + parts.join(" ");
-  return { text: text, overdue: overdue };
+  return { text: text, overdue: overdue, seconds: diff };
 }
 
-function refresh() {
+function phaseClass(phase) {
+  return "phase phase-" + (phase || "idle").toLowerCase().replace(/\s+/g, "");
+}
+
+// --- Generic sort helpers ---
+function compareStr(a, b) {
+  return (a || "").localeCompare(b || "");
+}
+
+function compareDate(a, b) {
+  var da = a ? new Date(a).getTime() : 0;
+  var db = b ? new Date(b).getTime() : 0;
+  return da - db;
+}
+
+// Return a comparator for jobs data given column index.
+function jobComparator(col) {
+  switch (col) {
+    case 0: return function(a, b) { return compareStr(a.resource, b.resource); };
+    case 1: return function(a, b) { return compareStr(a.cronPattern, b.cronPattern); };
+    case 2: return function(a, b) { return compareDate(a.lastRun, b.lastRun); };
+    case 3: return function(a, b) { return compareDate(a.nextRun, b.nextRun); };
+    case 4: return function(a, b) {
+      // Sort by seconds until next run
+      var sa = a.nextRun ? (new Date(a.nextRun) - new Date()) / 1000 : 0;
+      var sb = b.nextRun ? (new Date(b.nextRun) - new Date()) / 1000 : 0;
+      return sa - sb;
+    };
+    default: return function() { return 0; };
+  }
+}
+
+// Return a comparator for chains data given column index.
+function chainComparator(col) {
+  switch (col) {
+    case 0: return function(a, b) { return compareStr(a.name, b.name); };
+    case 1: return function(a, b) { return compareStr(a.cronPattern, b.cronPattern); };
+    case 2: return function(a, b) { return compareStr(a.phase, b.phase); };
+    case 3: return function(a, b) { return compareDate(a.lastRunTime, b.lastRunTime); };
+    case 4: return function(a, b) { return compareDate(a.lastCompletionTime, b.lastCompletionTime); };
+    default: return function() { return 0; };
+  }
+}
+
+function sortData(data, comparator, asc) {
+  data.sort(function(a, b) {
+    var result = comparator(a, b);
+    return asc ? result : -result;
+  });
+}
+
+// Update sort indicator classes on table headers.
+function updateSortIndicators(tableName) {
+  var headers = document.querySelectorAll('th.sortable[data-table="' + tableName + '"]');
+  var state = sortState[tableName];
+  for (var i = 0; i < headers.length; i++) {
+    headers[i].classList.remove("sort-asc", "sort-desc");
+    if (parseInt(headers[i].getAttribute("data-col"), 10) === state.col) {
+      headers[i].classList.add(state.asc ? "sort-asc" : "sort-desc");
+    }
+  }
+}
+
+// --- Rendering ---
+function renderJobs() {
+  var tbody = document.getElementById("tbody");
+  if (jobsData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No jobs scheduled</td></tr>';
+    return;
+  }
+  var state = sortState.jobs;
+  sortData(jobsData, jobComparator(state.col), state.asc);
+  var html = "";
+  for (var i = 0; i < jobsData.length; i++) {
+    var d = jobsData[i];
+    var tu = timeUntil(d.nextRun);
+    var style = tu.overdue ? ' style="color: red;"' : '';
+    html += "<tr><td>" + d.resource + "</td><td>" + d.cronPattern + "</td><td>" + (d.lastRun || "never") + "</td><td>" + d.nextRun + "</td><td" + style + ">" + tu.text + "</td></tr>";
+  }
+  tbody.innerHTML = html;
+  updateSortIndicators("jobs");
+}
+
+function renderChains() {
+  var tbody = document.getElementById("chains-tbody");
+  if (chainsData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No restart chains configured</td></tr>';
+    return;
+  }
+  var state = sortState.chains;
+  sortData(chainsData, chainComparator(state.col), state.asc);
+  var html = "";
+  for (var i = 0; i < chainsData.length; i++) {
+    var c = chainsData[i];
+    var pausedLabel = c.paused ? ' <span class="paused">(paused)</span>' : '';
+    var stepsHtml = '<ul class="step-list">';
+    for (var j = 0; j < c.stepStatuses.length; j++) {
+      var s = c.stepStatuses[j];
+      stepsHtml += '<li><span class="' + phaseClass(s.phase) + '">' + s.phase + '</span> ' + s.kind + '/' + s.name;
+      if (s.message) stepsHtml += ' &mdash; ' + s.message;
+      stepsHtml += '</li>';
+    }
+    if (c.stepStatuses.length === 0) {
+      stepsHtml += '<li class="empty">No steps executed yet</li>';
+    }
+    stepsHtml += '</ul>';
+    html += "<tr>" +
+      "<td>" + c.name + pausedLabel + "</td>" +
+      "<td>" + c.cronPattern + "</td>" +
+      '<td><span class="' + phaseClass(c.phase) + '">' + (c.phase || "Idle") + '</span></td>' +
+      "<td>" + (c.lastRunTime || "never") + "</td>" +
+      "<td>" + (c.lastCompletionTime || "-") + "</td>" +
+      "<td>" + stepsHtml + "</td>" +
+      "</tr>";
+  }
+  tbody.innerHTML = html;
+  updateSortIndicators("chains");
+}
+
+// --- Data fetching ---
+function refreshJobs() {
   fetch("/api/jobs")
     .then(function(r) { return r.json(); })
     .then(function(data) {
-      var tbody = document.getElementById("tbody");
-      if (data.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">No jobs scheduled</td></tr>';
-      } else {
-        var html = "";
-        data.sort(function(a, b) { return a.resource.localeCompare(b.resource) || a.cronPattern.localeCompare(b.cronPattern); });
-        for (var i = 0; i < data.length; i++) {
-          var d = data[i];
-          var tu = timeUntil(d.nextRun);
-          var style = tu.overdue ? ' style="color: red;"' : '';
-          html += "<tr><td>" + d.resource + "</td><td>" + d.cronPattern + "</td><td>" + (d.lastRun || "never") + "</td><td>" + d.nextRun + "</td><td" + style + ">" + tu.text + "</td></tr>";
-        }
-        tbody.innerHTML = html;
-      }
-      document.getElementById("updated").textContent = "Last updated: " + new Date().toISOString();
+      jobsData = data;
+      renderJobs();
     })
-    .catch(function(err) {
-      console.error("error fetching job status:", err);
-    });
+    .catch(function(err) { console.error("error fetching job status:", err); });
 }
 
+function refreshChains() {
+  fetch("/api/chains")
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      chainsData = data;
+      renderChains();
+    })
+    .catch(function(err) { console.error("error fetching chain status:", err); });
+}
+
+function refresh() {
+  refreshJobs();
+  refreshChains();
+  document.getElementById("updated").textContent = "Last updated: " + new Date().toISOString();
+}
+
+// --- Sort click handler ---
+document.addEventListener("click", function(e) {
+  var th = e.target.closest("th.sortable");
+  if (!th) return;
+  var tableName = th.getAttribute("data-table");
+  var col = parseInt(th.getAttribute("data-col"), 10);
+  var state = sortState[tableName];
+  if (state.col === col) {
+    state.asc = !state.asc;
+  } else {
+    state.col = col;
+    state.asc = true;
+  }
+  if (tableName === "jobs") renderJobs();
+  else renderChains();
+});
+
+// --- Refresh timer ---
 var refreshTimer = null;
 var nextRefreshAt = null;
 function scheduleRefresh() {
@@ -102,7 +287,8 @@ function scheduleRefresh() {
 document.getElementById("refreshInterval").addEventListener("change", scheduleRefresh);
 refresh();
 scheduleRefresh();
-// update time-until column and refresh countdown every second
+
+// Update time-until column and refresh countdown every second.
 setInterval(function() {
   if (nextRefreshAt) {
     var remaining = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));

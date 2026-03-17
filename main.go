@@ -26,11 +26,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
+	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	kairosv1alpha1 "github.com/erhudy/kairos/api/v1alpha1"
 	"github.com/erhudy/kairos/pkg"
+	"k8s.io/client-go/kubernetes"
 )
+
+var scheme = runtime.NewScheme()
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(kairosv1alpha1.AddToScheme(scheme))
+}
 
 func main() {
 	var debug bool
@@ -55,6 +69,9 @@ func main() {
 		logger, _ = zap.NewProduction()
 	}
 	defer func() { _ = logger.Sync() }()
+
+	// Set controller-runtime logger
+	ctrl.SetLogger(ctrlzap.New(ctrlzap.UseDevMode(debug)))
 
 	timezone, err := time.LoadLocation(tzstring)
 	if err != nil {
@@ -89,10 +106,33 @@ func main() {
 
 	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics)
 
+	// Create controller-runtime manager (disable its built-in metrics server since we have our own)
+	mgr, err := ctrl.NewManager(config, ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0", // disable controller-runtime metrics server
+		},
+	})
+	if err != nil {
+		logger.Fatal("unable to create controller-runtime manager", zap.Error(err))
+	}
+
+	// Create and register chain reconciler
+	chainReconciler := pkg.NewChainReconciler(mgr.GetClient(), clientset, logger, timezone, metrics)
+	if err := chainReconciler.SetupWithManager(mgr); err != nil {
+		logger.Fatal("unable to set up chain reconciler", zap.Error(err))
+	}
+
+	// Register chain reconciler's cron scheduler as a runnable so it starts/stops with the manager
+	if err := mgr.Add(chainReconciler); err != nil {
+		logger.Fatal("unable to add chain reconciler runnable", zap.Error(err))
+	}
+
 	// start HTTP server (metrics + web UI)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/api/jobs", scheduler.JobStatusJSON)
+	mux.HandleFunc("/api/chains", chainReconciler.ChainStatusJSON)
 	mux.HandleFunc("/", scheduler.JobStatusPage)
 	go func() {
 		logger.Info("starting HTTP server", zap.String("addr", metricsAddr))
@@ -100,11 +140,6 @@ func main() {
 			logger.Fatal("HTTP server failed", zap.Error(err))
 		}
 	}()
-
-	// Bind the workqueue to a cache with the help of an informer. This way we make sure that
-	// whenever the cache is updated, the pod key is added to the workqueue.
-	// Note that when we finally process the item from the workqueue, we might see a newer version
-	// of the Pod than the version which was responsible for triggering the update.
 
 	// Now let's start the controller
 	stop := make(chan struct{})
@@ -114,6 +149,8 @@ func main() {
 	go daemonSetController.Run(1, stop)
 	go scheduler.Run(stop)
 
-	// Wait forever
-	select {}
+	// Start controller-runtime manager (blocks)
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		logger.Fatal("controller-runtime manager exited with error", zap.Error(err))
+	}
 }
