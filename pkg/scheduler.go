@@ -15,6 +15,7 @@ import (
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -337,49 +338,72 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 	now := start.Format(LAST_RESTARTED_AT_TIME_FORMAT)
 	var err error
 
+	const maxRetries = 5
+
 	switch incomingObject.(type) {
 	case *appsv1.Deployment:
-		obj, getErr := clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-		if getErr != nil {
-			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
-			if metrics != nil {
-				metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+		for range maxRetries {
+			var obj *appsv1.Deployment
+			obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
+				if metrics != nil {
+					metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+				}
+				return
 			}
-			return
+			if obj.Spec.Template.Annotations == nil {
+				obj.Spec.Template.Annotations = make(map[string]string)
+			}
+			obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
+			_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			if err == nil || !k8serrors.IsConflict(err) {
+				break
+			}
+			logger.Warn("conflict updating object in restartFunc, retrying", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
 		}
-		if obj.Spec.Template.Annotations == nil {
-			obj.Spec.Template.Annotations = make(map[string]string)
-		}
-		obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
-		_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	case *appsv1.DaemonSet:
-		obj, getErr := clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if getErr != nil {
-			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
-			if metrics != nil {
-				metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+		for range maxRetries {
+			var obj *appsv1.DaemonSet
+			obj, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
+				if metrics != nil {
+					metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+				}
+				return
 			}
-			return
+			if obj.Spec.Template.Annotations == nil {
+				obj.Spec.Template.Annotations = make(map[string]string)
+			}
+			obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
+			_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			if err == nil || !k8serrors.IsConflict(err) {
+				break
+			}
+			logger.Warn("conflict updating object in restartFunc, retrying", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
 		}
-		if obj.Spec.Template.Annotations == nil {
-			obj.Spec.Template.Annotations = make(map[string]string)
-		}
-		obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
-		_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	case *appsv1.StatefulSet:
-		obj, getErr := clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-		if getErr != nil {
-			logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(getErr))
-			if metrics != nil {
-				metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+		for range maxRetries {
+			var obj *appsv1.StatefulSet
+			obj, err = clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
+				if metrics != nil {
+					metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
+				}
+				return
 			}
-			return
+			if obj.Spec.Template.Annotations == nil {
+				obj.Spec.Template.Annotations = make(map[string]string)
+			}
+			obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
+			_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
+			if err == nil || !k8serrors.IsConflict(err) {
+				break
+			}
+			logger.Warn("conflict updating object in restartFunc, retrying", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
 		}
-		if obj.Spec.Template.Annotations == nil {
-			obj.Spec.Template.Annotations = make(map[string]string)
-		}
-		obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
-		_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
 	default:
 		logger.Error("unsupported type in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)))
 		return
