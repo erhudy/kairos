@@ -1,10 +1,11 @@
 module github.com/erhudy/kairos
 
-go 1.25.7
+go 1.26.2
 
 require (
 	github.com/go-co-op/gocron v1.37.0
 	github.com/prometheus/client_golang v1.23.2
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/zap v1.27.1
 	k8s.io/apimachinery v0.35.1
@@ -42,7 +43,6 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
-	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.uber.org/atomic v1.11.0 // indirect

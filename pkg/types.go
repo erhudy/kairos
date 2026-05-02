@@ -3,6 +3,7 @@ package pkg
 import (
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
@@ -42,8 +43,9 @@ func (c cronPatterns) String() string {
 }
 
 type resourceMapEntry struct {
-	obj  runtime.Object
-	jobs map[cronPattern]*gocron.Job
+	obj         runtime.Object
+	jobs        map[cronPattern]*gocron.Job
+	lastJitters map[cronPattern]time.Duration
 }
 
 type resourceIdentifier string
@@ -55,6 +57,9 @@ type Scheduler struct {
 	clientset   kubernetes.Interface
 	resourceMap *sync.Map
 	metrics     *KairosMetrics
+	maxJitter   time.Duration
+	lookback    time.Duration
+	timezone    *time.Location
 }
 
 type SchedulerAction int

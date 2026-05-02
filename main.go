@@ -39,6 +39,8 @@ func main() {
 	var namespace string
 	var tzstring string
 	var metricsAddr string
+	var maxJitter time.Duration
+	var lookback time.Duration
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
@@ -46,6 +48,8 @@ func main() {
 	flag.StringVar(&namespace, "namespace", "", "namespace")
 	flag.StringVar(&tzstring, "timezone", "Local", "timezone that the scheduler should consider the system clock to be")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "address to serve Prometheus metrics on")
+	flag.DurationVar(&maxJitter, "jitter", 0, "maximum random jitter to add before each restart (e.g. 15m); 0 disables jitter")
+	flag.DurationVar(&lookback, "lookback", 0, "how far back to check for missed restarts on startup (e.g. 30m); 0 disables")
 	flag.Parse()
 
 	var logger *zap.Logger
@@ -87,12 +91,13 @@ func main() {
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
 
-	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics)
+	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback)
 
 	// start HTTP server (metrics + web UI)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/api/jobs", scheduler.JobStatusJSON)
+	mux.HandleFunc("/api/config", scheduler.ConfigJSON)
 	mux.HandleFunc("/", scheduler.JobStatusPage)
 	go func() {
 		logger.Info("starting HTTP server", zap.String("addr", metricsAddr))
