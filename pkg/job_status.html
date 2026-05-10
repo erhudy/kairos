@@ -54,7 +54,6 @@
       <th>Last Restart</th>
       <th>Last Jitter</th>
       <th>Next Scheduled Restart</th>
-      <th>Next Restart (Plus Jitter)</th>
       <th>Time Until Next Restart</th>
     </tr>
   </thead>
@@ -89,7 +88,7 @@ function refresh() {
         });
       }
       if (data.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="empty">No jobs scheduled</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">No jobs scheduled</td></tr>';
       } else {
         var html = "";
         data.sort(function(a, b) { return a.resource.localeCompare(b.resource) || a.cronPattern.localeCompare(b.cronPattern); });
@@ -97,7 +96,7 @@ function refresh() {
           var d = data[i];
           var tu = timeUntil(d.nextRun);
           var style = tu.overdue ? ' style="color: red;"' : '';
-          html += "<tr><td>" + d.resource + "</td><td>" + d.cronPattern + "</td><td>" + (d.lastRun || "never") + "</td><td>" + (d.lastJitter || "none") + "</td><td>" + d.nextRun + "</td><td>" + (d.nextRunWithJitter || "—") + "</td><td" + style + ">" + tu.text + "</td></tr>";
+          html += "<tr><td>" + d.resource + "</td><td>" + d.cronPattern + "</td><td>" + (d.lastRun || "never") + "</td><td>" + (d.lastJitter || "none") + "</td><td>" + d.nextRun + "</td><td" + style + ">" + tu.text + "</td></tr>";
         }
         tbody.innerHTML = html;
       }
@@ -149,10 +148,12 @@ setInterval(function() {
   var rows = document.getElementById("tbody").querySelectorAll("tr");
   for (var i = 0; i < rows.length; i++) {
     var cells = rows[i].querySelectorAll("td");
-    if (cells.length === 7 && cells[4].textContent && cells[4].textContent !== "") {
+    if (cells.length === 6 && cells[4].textContent && cells[4].textContent !== "") {
       var tu = timeUntil(cells[4].textContent);
-      cells[6].textContent = tu.text;
-      cells[6].style.color = tu.overdue ? "red" : "";
+      cells[5].textContent = tu.text;
+      cells[5].style.color = tu.overdue ? "red" : "";
+    }
+  }
     }
   }
 }, 1000);

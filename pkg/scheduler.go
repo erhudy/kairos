@@ -56,12 +56,11 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 }
 
 type jobStatusEntry struct {
-	Resource          string `json:"resource"`
-	CronPattern       string `json:"cronPattern"`
-	LastRun           string `json:"lastRun"`
-	NextRun           string `json:"nextRun"`
-	LastJitter        string `json:"lastJitter"`
-	NextRunWithJitter string `json:"nextRunWithJitter,omitempty"`
+	Resource    string `json:"resource"`
+	CronPattern string `json:"cronPattern"`
+	LastRun     string `json:"lastRun"`
+	NextRun     string `json:"nextRun"`
+	LastJitter  string `json:"lastJitter"`
 }
 
 type configStatus struct {
@@ -96,21 +95,20 @@ func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
 	s.resourceMap.Range(func(key, value any) bool {
 		ri := key.(resourceIdentifier)
 		entry := value.(*resourceMapEntry)
+		entry.RLock()
+		defer entry.RUnlock()
 		for cp, job := range entry.jobs {
 			lastRunStr := getPodTemplateAnnotation(entry.obj, CRON_LAST_RESTARTED_AT_KEY)
 			lastJitterStr := ""
-			nextRunWithJitter := ""
 			if j, ok := entry.lastJitters[cp]; ok && j > 0 {
 				lastJitterStr = j.Round(time.Millisecond).String()
-				nextRunWithJitter = job.NextRun().Add(j).UTC().Format(time.RFC3339)
 			}
 			entries = append(entries, jobStatusEntry{
-				Resource:          string(ri),
-				CronPattern:       string(cp),
-				LastRun:           lastRunStr,
-				NextRun:           job.NextRun().UTC().Format(time.RFC3339),
-				LastJitter:        lastJitterStr,
-				NextRunWithJitter: nextRunWithJitter,
+				Resource:    string(ri),
+				CronPattern: string(cp),
+				LastRun:     lastRunStr,
+				NextRun:     job.NextRun().UTC().Format(time.RFC3339),
+				LastJitter:  lastJitterStr,
 			})
 		}
 		return true
@@ -184,6 +182,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		registeredJobsForResourceRaw = entry
 	}
 	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+	entry.Lock()
 	if entry.lastJitters == nil {
 		entry.lastJitters = make(map[cronPattern]time.Duration)
 	}
@@ -191,6 +190,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	for pattern := range entry.jobs {
 		cronPatternsFromMap = append(cronPatternsFromMap, pattern)
 	}
+	entry.Unlock()
 
 	// strings and not cronPatterns
 	patternsToAdd := []cronPattern{}
@@ -309,7 +309,10 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 			jitter := time.Duration(rand.Int64N(int64(maxJitter)))
 			logger.Info("applying jitter before restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cp)), zap.Duration("jitter", jitter))
 			if entryRaw, ok := resourceMap.Load(ri); ok {
-				entryRaw.(*resourceMapEntry).lastJitters[cp] = jitter
+				entry := entryRaw.(*resourceMapEntry)
+				entry.Lock()
+				entry.lastJitters[cp] = jitter
+				entry.Unlock()
 			}
 			time.Sleep(jitter)
 		}
@@ -333,8 +336,10 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 		}
 	}
 	registeredEntry := registeredJobsForResourceRaw.(*resourceMapEntry)
-
+	registeredEntry.Lock()
 	registeredEntry.jobs[cp] = job
+	registeredEntry.Unlock()
+
 
 	if s.metrics != nil {
 		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Inc()
@@ -357,7 +362,14 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	}
 	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
 
-	for cronPattern, job := range entry.jobs {
+	entry.RLock()
+	jobsToDelete := make(map[cronPattern]*gocron.Job)
+	for cp, job := range entry.jobs {
+		jobsToDelete[cp] = job
+	}
+	entry.RUnlock()
+
+	for cronPattern, job := range jobsToDelete {
 		err := s.deleteJob(cronPattern, ri, job, obj)
 		if err != nil {
 			return err
@@ -383,7 +395,10 @@ func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron
 			return fmt.Errorf("resource %s not found in resource map", ri)
 		}
 		entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+		entry.Lock()
 		delete(entry.jobs, cp)
+		delete(entry.lastJitters, cp)
+		entry.Unlock()
 		s.logger.Info(
 			"deleted job",
 			zap.String("resource", string(ri)),

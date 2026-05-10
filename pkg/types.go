@@ -43,6 +43,7 @@ func (c cronPatterns) String() string {
 }
 
 type resourceMapEntry struct {
+	sync.RWMutex
 	obj         runtime.Object
 	jobs        map[cronPattern]*gocron.Job
 	lastJitters map[cronPattern]time.Duration
