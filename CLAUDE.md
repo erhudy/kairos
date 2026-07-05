@@ -24,6 +24,8 @@ golangci-lint run
 go run main.go -kubeconfig ~/.kube/config
 ```
 
+Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
+
 ## Architecture
 
 Kairos is a Kubernetes controller that automatically restarts workloads (Deployments, DaemonSets, StatefulSets) on cron schedules defined via annotations.
@@ -41,12 +43,14 @@ Kubernetes Informer (per resource type)
         → sends ObjectAndSchedulerAction on channel
     → Scheduler.run() [pkg/scheduler.go]
         → reconcileJobsForResource(): add/update/remove gocron jobs
-        → restartFunc(): patches PodTemplateSpec on schedule
+        → checkMissedRestart(): with -lookback, one catch-up restart per resource
+          for firings missed while kairos was not running (gated on scheduler startTime)
+        → restartFunc(): patches PodTemplateSpec on schedule (after optional jitter sleep)
 ```
 
 ### Key files
 
-- `main.go` — parses flags, wires together controllers + scheduler, handles SIGUSR1 to dump job status
+- `main.go` — parses flags, wires together controllers + scheduler + HTTP server, shuts down gracefully on SIGINT/SIGTERM
 - `pkg/controller.go` — generic Kubernetes controller (informer → workqueue → synchronize); three factory functions for each resource type
 - `pkg/synchronize.go` — business logic called per queue item: decides RESOURCE_CHANGE vs RESOURCE_DELETE
 - `pkg/scheduler.go` — manages gocron jobs per resource; `reconcileJobsForResource()` diffs current vs desired jobs; `restartFunc()` does the actual patch
@@ -64,5 +68,6 @@ Kubernetes Informer (per resource type)
 
 - One goroutine per controller (3 total: Deployment, DaemonSet, StatefulSet)
 - One scheduler goroutine consuming the shared work channel
-- `sync.Map` for resource-to-jobs tracking; channels for controller→scheduler communication
+- `sync.Map` for resource-to-jobs tracking, with a per-entry `sync.RWMutex` (`resourceMapEntry`) guarding each entry's jobs/lastJitters maps; channels for controller→scheduler communication
+- gocron fires each job in its own goroutine; jitter sleeps select on the scheduler's shutdown context and re-check job registration afterward, so deleted jobs don't restart and shutdown isn't blocked
 - Controllers retry failed items up to 5 times with rate limiting

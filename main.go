@@ -21,6 +21,9 @@ package main
 import (
 	"flag"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,6 +42,8 @@ func main() {
 	var namespace string
 	var tzstring string
 	var metricsAddr string
+	var maxJitter time.Duration
+	var lookback time.Duration
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
@@ -46,6 +51,8 @@ func main() {
 	flag.StringVar(&namespace, "namespace", "", "namespace")
 	flag.StringVar(&tzstring, "timezone", "Local", "timezone that the scheduler should consider the system clock to be")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "address to serve Prometheus metrics on")
+	flag.DurationVar(&maxJitter, "jitter", 0, "maximum random jitter to add before each restart (e.g. 15m); 0 disables jitter")
+	flag.DurationVar(&lookback, "lookback", 0, "how far back to check for missed restarts on startup (e.g. 30m); 0 disables")
 	flag.Parse()
 
 	var logger *zap.Logger
@@ -87,12 +94,13 @@ func main() {
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
 
-	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics)
+	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback)
 
 	// start HTTP server (metrics + web UI)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/api/jobs", scheduler.JobStatusJSON)
+	mux.HandleFunc("/api/config", scheduler.ConfigJSON)
 	mux.HandleFunc("/", scheduler.JobStatusPage)
 	go func() {
 		logger.Info("starting HTTP server", zap.String("addr", metricsAddr))
@@ -108,12 +116,25 @@ func main() {
 
 	// Now let's start the controller
 	stop := make(chan struct{})
-	defer close(stop)
 	go deploymentController.Run(1, stop)
 	go statefulSetController.Run(1, stop)
 	go daemonSetController.Run(1, stop)
-	go scheduler.Run(stop)
 
-	// Wait forever
-	select {}
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		scheduler.Run(stop)
+	}()
+
+	// wait for SIGINT/SIGTERM, then shut down the controllers and scheduler
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+	close(stop)
+
+	// wait for the scheduler to finish stopping (it wakes any in-flight jitter
+	// sleeps and then waits for gocron to stop) before exiting
+	<-schedulerDone
+	logger.Info("shutdown complete")
 }

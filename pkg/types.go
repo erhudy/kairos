@@ -1,8 +1,10 @@
 package pkg
 
 import (
+	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-co-op/gocron"
 	"go.uber.org/zap"
@@ -42,8 +44,10 @@ func (c cronPatterns) String() string {
 }
 
 type resourceMapEntry struct {
-	obj  runtime.Object
-	jobs map[cronPattern]*gocron.Job
+	sync.RWMutex
+	obj         runtime.Object
+	jobs        map[cronPattern]*gocron.Job
+	lastJitters map[cronPattern]time.Duration
 }
 
 type resourceIdentifier string
@@ -55,6 +59,14 @@ type Scheduler struct {
 	clientset   kubernetes.Interface
 	resourceMap *sync.Map
 	metrics     *KairosMetrics
+	maxJitter   time.Duration
+	lookback    time.Duration
+	timezone    *time.Location
+	// startTime is when this scheduler instance came up; missed-restart catch-up
+	// only applies to firings from before then (i.e. while kairos was not running)
+	startTime      time.Time
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 type SchedulerAction int
