@@ -27,16 +27,21 @@ func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan O
 	scheduler := gocron.NewScheduler(timezone)
 	scheduler.TagsUnique()
 
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+
 	return &Scheduler{
-		logger:      logger,
-		workchan:    workchan,
-		cron:        scheduler,
-		clientset:   clientset,
-		resourceMap: &sync.Map{},
-		metrics:     metrics,
-		maxJitter:   maxJitter,
-		lookback:    lookback,
-		timezone:    timezone,
+		logger:         logger,
+		workchan:       workchan,
+		cron:           scheduler,
+		clientset:      clientset,
+		resourceMap:    &sync.Map{},
+		metrics:        metrics,
+		maxJitter:      maxJitter,
+		lookback:       lookback,
+		timezone:       timezone,
+		startTime:      time.Now(),
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 	}
 }
 
@@ -47,6 +52,8 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 		select {
 		case <-stopCh:
 			s.logger.Info("stopping scheduler")
+			// wake any goroutines sleeping in a jitter delay so Stop does not block on them
+			s.shutdownCancel()
 			s.cron.Stop()
 			return
 		case i := <-s.workchan:
@@ -97,8 +104,8 @@ func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
 		entry := value.(*resourceMapEntry)
 		entry.RLock()
 		defer entry.RUnlock()
+		lastRunStr := getPodTemplateAnnotation(entry.obj, CRON_LAST_RESTARTED_AT_KEY)
 		for cp, job := range entry.jobs {
-			lastRunStr := getPodTemplateAnnotation(entry.obj, CRON_LAST_RESTARTED_AT_KEY)
 			lastJitterStr := ""
 			if j, ok := entry.lastJitters[cp]; ok && j > 0 {
 				lastJitterStr = j.Round(time.Millisecond).String()
@@ -171,21 +178,8 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 
 	// build a comparison list against the keys in the resource map for this resource to figure out what to add/delete/ignore
 	cronPatternsFromMap := cronPatterns{}
-	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
-	if !ok {
-		entry := &resourceMapEntry{
-			obj:         obj,
-			jobs:        make(map[cronPattern]*gocron.Job),
-			lastJitters: make(map[cronPattern]time.Duration),
-		}
-		s.resourceMap.Store(ri, entry)
-		registeredJobsForResourceRaw = entry
-	}
-	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+	entry := s.getOrCreateEntry(ri, obj)
 	entry.Lock()
-	if entry.lastJitters == nil {
-		entry.lastJitters = make(map[cronPattern]time.Duration)
-	}
 	entry.obj = obj
 	for pattern := range entry.jobs {
 		cronPatternsFromMap = append(cronPatternsFromMap, pattern)
@@ -242,6 +236,9 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 			return fmt.Errorf("error while adding job during reconcile: %w", err)
 		}
 	}
+	if len(patternsToAdd) > 0 {
+		s.checkMissedRestart(patternsToAdd, obj)
+	}
 	for _, p := range patternsToDelete {
 		job := entry.jobs[p]
 		err := s.deleteJob(p, ri, job, obj)
@@ -251,6 +248,25 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	}
 
 	return nil
+}
+
+// getOrCreateEntry returns the resource map entry for ri, creating and storing
+// a fresh one (and bumping the tracked-resources gauge) if none exists yet.
+func (s *Scheduler) getOrCreateEntry(ri resourceIdentifier, obj runtime.Object) *resourceMapEntry {
+	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+	if !ok {
+		entry := &resourceMapEntry{
+			obj:         obj,
+			jobs:        make(map[cronPattern]*gocron.Job),
+			lastJitters: make(map[cronPattern]time.Duration),
+		}
+		s.resourceMap.Store(ri, entry)
+		if s.metrics != nil {
+			s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Inc()
+		}
+		return entry
+	}
+	return registeredJobsForResourceRaw.(*resourceMapEntry)
 }
 
 // creates/updates the job (by deleting/recreating) and returns it for inspection
@@ -289,65 +305,86 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 
 	var err error
 
-	maxJitter := clampedMaxJitter(cp, s.maxJitter, s.timezone)
-	if s.maxJitter > 0 && maxJitter < s.maxJitter {
-		s.logger.Info("jitter clamped to 50% of schedule interval",
+	// parsed once here so each firing can clamp jitter against its actual next interval
+	schedule, _, err := parseCronExpression(cp, s.timezone)
+	if err != nil {
+		s.logger.Warn("could not parse cron pattern for jitter clamping, using unclamped jitter", zap.String("cron-pattern", string(cp)), zap.Error(err))
+		schedule = nil
+	}
+
+	scheduler := cronFunc(cpString)
+	job, err = scheduler.Tag(string(tag)).Do(func() {
+		if s.maxJitter > 0 {
+			if !s.sleepWithJitter(cp, ri, schedule) {
+				return
+			}
+			// the job may have been deleted while we slept; do not restart if so
+			if !s.jobStillRegistered(cp, ri) {
+				s.logger.Info("job removed during jitter sleep, skipping restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cp)))
+				return
+			}
+		}
+		restartFunc(ctx, s.logger, s.clientset, obj, s.metrics)
+	})
+	if err != nil {
+		return fmt.Errorf("error in createJob during creation: %w", err)
+	}
+
+	registeredEntry := s.getOrCreateEntry(ri, obj)
+	registeredEntry.Lock()
+	registeredEntry.jobs[cp] = job
+	registeredEntry.Unlock()
+
+	if s.metrics != nil {
+		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Inc()
+	}
+
+	return nil
+}
+
+// sleepWithJitter sleeps for a random duration up to maxJitter (clamped to half the
+// time until the schedule's next firing) and records it for the status page.
+// Returns false if the scheduler shut down during the sleep.
+func (s *Scheduler) sleepWithJitter(cp cronPattern, ri resourceIdentifier, schedule cron.Schedule) bool {
+	maxJitter := clampJitterToSchedule(s.maxJitter, schedule, time.Now())
+	if maxJitter < s.maxJitter {
+		s.logger.Info("jitter clamped to 50% of time until next firing",
 			zap.String("resource", string(ri)),
 			zap.String("cron-pattern", string(cp)),
 			zap.Duration("requested", s.maxJitter),
 			zap.Duration("effective", maxJitter),
 		)
 	}
-	logger := s.logger
-	clientset := s.clientset
-	metrics := s.metrics
-	resourceMap := s.resourceMap
-
-	scheduler := cronFunc(cpString)
-	job, err = scheduler.Tag(string(tag)).Do(func() {
-		if maxJitter > 0 {
-			jitter := time.Duration(rand.Int64N(int64(maxJitter)))
-			logger.Info("applying jitter before restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cp)), zap.Duration("jitter", jitter))
-			if entryRaw, ok := resourceMap.Load(ri); ok {
-				entry := entryRaw.(*resourceMapEntry)
-				entry.Lock()
-				entry.lastJitters[cp] = jitter
-				entry.Unlock()
-			}
-			time.Sleep(jitter)
-		}
-		restartFunc(ctx, logger, clientset, obj, metrics)
-	})
-	if err != nil {
-		return fmt.Errorf("error in createJob during creation: %w", err)
+	if maxJitter <= 0 {
+		return true
 	}
+	jitter := time.Duration(rand.Int64N(int64(maxJitter)))
+	s.logger.Info("applying jitter before restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cp)), zap.Duration("jitter", jitter))
+	if entryRaw, ok := s.resourceMap.Load(ri); ok {
+		entry := entryRaw.(*resourceMapEntry)
+		entry.Lock()
+		entry.lastJitters[cp] = jitter
+		entry.Unlock()
+	}
+	select {
+	case <-time.After(jitter):
+		return true
+	case <-s.shutdownCtx.Done():
+		return false
+	}
+}
 
-	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+// jobStillRegistered reports whether the job for cp is still tracked for ri.
+func (s *Scheduler) jobStillRegistered(cp cronPattern, ri resourceIdentifier) bool {
+	entryRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
-		entry := &resourceMapEntry{
-			obj:         obj,
-			jobs:        make(map[cronPattern]*gocron.Job),
-			lastJitters: make(map[cronPattern]time.Duration),
-		}
-		s.resourceMap.Store(ri, entry)
-		registeredJobsForResourceRaw = entry
-		if s.metrics != nil {
-			s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Inc()
-		}
+		return false
 	}
-	registeredEntry := registeredJobsForResourceRaw.(*resourceMapEntry)
-	registeredEntry.Lock()
-	registeredEntry.jobs[cp] = job
-	registeredEntry.Unlock()
-
-
-	if s.metrics != nil {
-		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Inc()
-	}
-
-	s.checkMissedRestart(cp, obj)
-
-	return nil
+	entry := entryRaw.(*resourceMapEntry)
+	entry.RLock()
+	defer entry.RUnlock()
+	_, ok = entry.jobs[cp]
+	return ok
 }
 
 func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
@@ -411,34 +448,32 @@ func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron
 	return nil
 }
 
-// clampedMaxJitter returns maxJitter clamped to 50% of the schedule interval for cp.
-// Falls back to maxJitter unchanged if the interval cannot be determined.
-func clampedMaxJitter(cp cronPattern, maxJitter time.Duration, timezone *time.Location) time.Duration {
-	if maxJitter == 0 {
-		return 0
-	}
-	schedule, _, err := parseCronExpression(cp, timezone)
-	if err != nil {
+// clampJitterToSchedule returns maxJitter clamped to 50% of the time remaining until
+// the schedule's next firing after now, so a jitter sleep can never overshoot the
+// following firing. Falls back to maxJitter unchanged if the schedule is unavailable.
+func clampJitterToSchedule(maxJitter time.Duration, schedule cron.Schedule, now time.Time) time.Duration {
+	if maxJitter <= 0 || schedule == nil {
 		return maxJitter
 	}
-	now := time.Now()
-	next1 := schedule.Next(now)
-	if next1.IsZero() {
+	next := schedule.Next(now)
+	if next.IsZero() {
 		return maxJitter
 	}
-	next2 := schedule.Next(next1)
-	if next2.IsZero() {
-		return maxJitter
-	}
-	half := next2.Sub(next1) / 2
+	half := next.Sub(now) / 2
 	if maxJitter > half {
 		return half
 	}
 	return maxJitter
 }
 
+// cronExpressionParser accepts both 5-field (standard) and 6-field (with seconds)
+// expressions, matching what gocron accepts via Cron/CronWithSeconds.
+var cronExpressionParser = cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+
 // parseCronExpression parses a cron pattern string (with optional TZ= or CRON_TZ= prefix)
-// into a robfig/cron Schedule and the effective timezone location.
+// into a robfig/cron Schedule and the effective timezone location. The returned schedule
+// evaluates in that location, mirroring how gocron fires the job (gocron prefixes the
+// expression with CRON_TZ=<scheduler location> when no TZ prefix is present).
 func parseCronExpression(cp cronPattern, defaultLoc *time.Location) (cron.Schedule, *time.Location, error) {
 	cpString := string(cp)
 	loc := defaultLoc
@@ -459,27 +494,21 @@ func parseCronExpression(cp cronPattern, defaultLoc *time.Location) (cron.Schedu
 		}
 	}
 
-	fields := strings.Fields(cpString)
-	var parser cron.Parser
-	switch len(fields) {
-	case 5:
-		parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	case 6:
-		parser = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	default:
-		return nil, nil, fmt.Errorf("invalid cron expression field count %d in %q", len(fields), cpString)
-	}
-
-	schedule, err := parser.Parse(cpString)
+	schedule, err := cronExpressionParser.Parse(cpString)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error parsing cron expression %q: %w", cpString, err)
+	}
+	// the parser defaults to time.Local since the TZ prefix was stripped above;
+	// pin the schedule to the effective location instead
+	if specSchedule, ok := schedule.(*cron.SpecSchedule); ok {
+		specSchedule.Location = loc
 	}
 	return schedule, loc, nil
 }
 
 // findLastScheduledTimeInWindow returns the most recent scheduled time in [windowStart, now).
-func findLastScheduledTimeInWindow(schedule cron.Schedule, loc *time.Location, windowStart, now time.Time) (time.Time, bool) {
-	t := windowStart.In(loc).Add(-time.Nanosecond)
+func findLastScheduledTimeInWindow(schedule cron.Schedule, windowStart, now time.Time) (time.Time, bool) {
+	t := windowStart.Add(-time.Nanosecond)
 	var lastTime time.Time
 	for {
 		next := schedule.Next(t)
@@ -495,27 +524,43 @@ func findLastScheduledTimeInWindow(schedule cron.Schedule, loc *time.Location, w
 	return lastTime, true
 }
 
-func (s *Scheduler) checkMissedRestart(cp cronPattern, obj runtime.Object) {
-	s.checkMissedRestartAt(cp, obj, time.Now())
+func (s *Scheduler) checkMissedRestart(cps []cronPattern, obj runtime.Object) {
+	s.checkMissedRestartAt(cps, obj, time.Now())
 }
 
-// checkMissedRestartAt triggers an immediate catch-up restart if the resource missed a scheduled
-// restart within the lookback window relative to now.
-func (s *Scheduler) checkMissedRestartAt(cp cronPattern, obj runtime.Object, now time.Time) {
+// checkMissedRestartAt triggers at most one catch-up restart for the resource if any of its
+// cron patterns had a firing within the lookback window relative to now that was missed
+// because kairos was not running at the time. Firings after the scheduler started are
+// handled by the regular jobs and never treated as missed.
+func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, now time.Time) {
 	if s.lookback == 0 {
 		return
 	}
 
 	windowStart := now.Add(-s.lookback)
 
-	schedule, loc, err := parseCronExpression(cp, s.timezone)
-	if err != nil {
-		s.logger.Error("missed restart check: error parsing cron pattern", zap.String("pattern", string(cp)), zap.Error(err))
-		return
-	}
+	// find the most recent missed firing across all of the resource's patterns
+	var lastScheduled time.Time
+	var missedPattern cronPattern
+	var missedSchedule cron.Schedule
+	for _, cp := range cps {
+		schedule, _, err := parseCronExpression(cp, s.timezone)
+		if err != nil {
+			s.logger.Error("missed restart check: error parsing cron pattern", zap.String("pattern", string(cp)), zap.Error(err))
+			continue
+		}
 
-	lastScheduled, found := findLastScheduledTimeInWindow(schedule, loc, windowStart, now)
-	if !found {
+		scheduled, found := findLastScheduledTimeInWindow(schedule, windowStart, now)
+		if !found || !scheduled.Before(s.startTime) {
+			continue
+		}
+		if scheduled.After(lastScheduled) {
+			lastScheduled = scheduled
+			missedPattern = cp
+			missedSchedule = schedule
+		}
+	}
+	if lastScheduled.IsZero() {
 		return
 	}
 
@@ -531,12 +576,18 @@ func (s *Scheduler) checkMissedRestartAt(cp cronPattern, obj runtime.Object, now
 	ri := getResourceIdentifier(om, objk)
 	s.logger.Info("missed restart detected, triggering catch-up restart",
 		zap.String("resource", string(ri)),
-		zap.String("cron-pattern", string(cp)),
+		zap.String("cron-pattern", string(missedPattern)),
 		zap.Time("lastScheduled", lastScheduled),
 	)
 
-	ctx := context.Background()
-	go restartFunc(ctx, s.logger, s.clientset, obj, s.metrics)
+	go func() {
+		if s.maxJitter > 0 {
+			if !s.sleepWithJitter(missedPattern, ri, missedSchedule) {
+				return
+			}
+		}
+		restartFunc(context.Background(), s.logger, s.clientset, obj, s.metrics)
+	}()
 }
 
 func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, incomingObject runtime.Object, metrics *KairosMetrics) {

@@ -5,13 +5,13 @@ import (
 )
 
 type KairosMetrics struct {
-	RestartTotal         *prometheus.CounterVec
-	TrackedResources     *prometheus.GaugeVec
-	RestartErrorsTotal   *prometheus.CounterVec
-	RestartDuration      *prometheus.HistogramVec
-	ScheduledJobs        *prometheus.GaugeVec
-	QueueDepth           *prometheus.GaugeVec
-	SyncErrorsTotal      *prometheus.CounterVec
+	RestartTotal       *prometheus.CounterVec
+	TrackedResources   *prometheus.GaugeVec
+	RestartErrorsTotal *prometheus.CounterVec
+	RestartDuration    *prometheus.HistogramVec
+	ScheduledJobs      *prometheus.GaugeVec
+	QueueDepth         *prometheus.GaugeVec
+	SyncErrorsTotal    *prometheus.CounterVec
 }
 
 func NewKairosMetrics() *KairosMetrics {

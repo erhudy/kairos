@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,11 @@ type Scheduler struct {
 	maxJitter   time.Duration
 	lookback    time.Duration
 	timezone    *time.Location
+	// startTime is when this scheduler instance came up; missed-restart catch-up
+	// only applies to firings from before then (i.e. while kairos was not running)
+	startTime      time.Time
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 type SchedulerAction int

@@ -491,7 +491,7 @@ func TestFindLastScheduledTimeInWindow(t *testing.T) {
 		now := time.Date(2024, 1, 1, 10, 30, 0, 0, time.UTC)
 		windowStart := now.Add(-2 * time.Hour)
 
-		last, found := findLastScheduledTimeInWindow(sched, time.UTC, windowStart, now)
+		last, found := findLastScheduledTimeInWindow(sched, windowStart, now)
 		require.True(t, found)
 		require.Equal(t, time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC), last)
 	})
@@ -504,7 +504,7 @@ func TestFindLastScheduledTimeInWindow(t *testing.T) {
 		now := time.Date(2024, 1, 1, 10, 30, 0, 0, time.UTC)
 		windowStart := now.Add(-30 * time.Minute)
 
-		_, found := findLastScheduledTimeInWindow(sched, time.UTC, windowStart, now)
+		_, found := findLastScheduledTimeInWindow(sched, windowStart, now)
 		require.False(t, found)
 	})
 
@@ -516,7 +516,7 @@ func TestFindLastScheduledTimeInWindow(t *testing.T) {
 		now := time.Date(2024, 1, 1, 10, 35, 0, 0, time.UTC)
 		windowStart := now.Add(-30 * time.Minute)
 
-		last, found := findLastScheduledTimeInWindow(sched, time.UTC, windowStart, now)
+		last, found := findLastScheduledTimeInWindow(sched, windowStart, now)
 		require.True(t, found)
 		require.Equal(t, time.Date(2024, 1, 1, 10, 30, 0, 0, time.UTC), last)
 	})
@@ -553,7 +553,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		dep := makeDeployment("")
 		s, clientset := newTestSchedulerWithLookback(t, 30*time.Minute, dep)
 
-		s.checkMissedRestartAt(cronPattern("0 * * * *"), dep, now)
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
 
 		require.Eventually(t, func() bool {
 			obj, err := clientset.AppsV1().Deployments("ns1").Get(context.TODO(), "test-dep", metav1.GetOptions{})
@@ -569,7 +569,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		dep := makeDeployment(beforeLastScheduled)
 		s, clientset := newTestSchedulerWithLookback(t, 30*time.Minute, dep)
 
-		s.checkMissedRestartAt(cronPattern("0 * * * *"), dep, now)
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
 
 		require.Eventually(t, func() bool {
 			obj, err := clientset.AppsV1().Deployments("ns1").Get(context.TODO(), "test-dep", metav1.GetOptions{})
@@ -590,7 +590,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		dep := makeDeployment(afterLastScheduled)
 		s, clientset := newTestSchedulerWithLookback(t, 30*time.Minute, dep)
 
-		s.checkMissedRestartAt(cronPattern("0 * * * *"), dep, now)
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
 
 		// Give the goroutine a moment to fire if it were going to
 		time.Sleep(100 * time.Millisecond)
@@ -604,7 +604,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		dep := makeDeployment("")
 		s, clientset := newTestScheduler(t, dep) // lookback=0
 
-		s.checkMissedRestartAt(cronPattern("0 * * * *"), dep, now)
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
 
 		time.Sleep(100 * time.Millisecond)
 
@@ -618,7 +618,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		dep := makeDeployment("")
 		s, clientset := newTestSchedulerWithLookback(t, 5*time.Minute, dep) // only 5m window; last hourly was 20m ago
 
-		s.checkMissedRestartAt(cronPattern("0 * * * *"), dep, now)
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
 
 		time.Sleep(100 * time.Millisecond)
 
@@ -627,19 +627,71 @@ func TestCheckMissedRestart(t *testing.T) {
 		_, hasAnn := obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY]
 		require.False(t, hasAnn)
 	})
+
+	t.Run("no restart when firing occurred after scheduler start", func(t *testing.T) {
+		dep := makeDeployment("")
+		s, clientset := newTestSchedulerWithLookback(t, 30*time.Minute, dep)
+		// scheduler was already running before the 10:00 firing, so the regular job owns it
+		s.startTime = lastScheduledTime.Add(-5 * time.Minute)
+
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
+
+		time.Sleep(100 * time.Millisecond)
+
+		obj, err := clientset.AppsV1().Deployments("ns1").Get(context.TODO(), "test-dep", metav1.GetOptions{})
+		require.NoError(t, err)
+		_, hasAnn := obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY]
+		require.False(t, hasAnn)
+	})
+
+	t.Run("multiple missed patterns trigger only one restart", func(t *testing.T) {
+		dep := makeDeployment("")
+		s, clientset := newTestSchedulerWithLookback(t, 30*time.Minute, dep)
+
+		// both patterns fired in the window (10:00 and 10:10); expect a single catch-up
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *", "10 * * * *"}, dep, now)
+
+		require.Eventually(t, func() bool {
+			obj, err := clientset.AppsV1().Deployments("ns1").Get(context.TODO(), "test-dep", metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			_, ok := obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY]
+			return ok
+		}, 5*time.Second, 10*time.Millisecond)
+
+		// allow any (buggy) second restart goroutine time to land, then count updates
+		time.Sleep(200 * time.Millisecond)
+		updates := 0
+		for _, action := range clientset.Actions() {
+			if action.GetVerb() == "update" && action.GetResource().Resource == "deployments" {
+				updates++
+			}
+		}
+		require.Equal(t, 1, updates, "expected exactly one catch-up restart across patterns")
+	})
 }
 
-// --- TestClampedMaxJitter ---
+// --- TestClampJitterToSchedule ---
 
-func TestClampedMaxJitter(t *testing.T) {
+func TestClampJitterToSchedule(t *testing.T) {
 	t.Parallel()
-	utc := time.UTC
+
+	mustParse := func(t *testing.T, pattern cronPattern) cron.Schedule {
+		t.Helper()
+		sched, _, err := parseCronExpression(pattern, time.UTC)
+		require.NoError(t, err)
+		return sched
+	}
+
+	// with "* * * * *" the next firing after now is 10:01:00 → 60s away → half = 30s
+	now := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
 
 	tests := []struct {
-		name     string
-		pattern  cronPattern
-		jitter   time.Duration
-		wantMax  time.Duration
+		name    string
+		pattern cronPattern
+		jitter  time.Duration
+		wantMax time.Duration
 	}{
 		{
 			name:    "zero jitter returns zero",
@@ -648,26 +700,26 @@ func TestClampedMaxJitter(t *testing.T) {
 			wantMax: 0,
 		},
 		{
-			name:    "jitter below half interval returned unchanged",
-			pattern: "* * * * *", // 60s interval → half = 30s
+			name:    "jitter below half remaining returned unchanged",
+			pattern: "* * * * *",
 			jitter:  10 * time.Second,
 			wantMax: 10 * time.Second,
 		},
 		{
-			name:    "jitter equal to half interval returned unchanged",
-			pattern: "* * * * *", // 60s interval → half = 30s
+			name:    "jitter equal to half remaining returned unchanged",
+			pattern: "* * * * *",
 			jitter:  30 * time.Second,
 			wantMax: 30 * time.Second,
 		},
 		{
-			name:    "jitter above half interval clamped to half",
-			pattern: "* * * * *", // 60s interval → half = 30s
+			name:    "jitter above half remaining clamped to half",
+			pattern: "* * * * *",
 			jitter:  time.Minute,
 			wantMax: 30 * time.Second,
 		},
 		{
 			name:    "hourly schedule clamps large jitter",
-			pattern: "0 * * * *", // 3600s interval → half = 1800s
+			pattern: "0 * * * *", // next firing 11:00 → 3600s away → half = 1800s
 			jitter:  time.Hour,
 			wantMax: 30 * time.Minute,
 		},
@@ -678,14 +730,8 @@ func TestClampedMaxJitter(t *testing.T) {
 			wantMax: 5 * time.Minute,
 		},
 		{
-			name:    "invalid pattern falls back to original jitter",
-			pattern: "invalid",
-			jitter:  time.Minute,
-			wantMax: time.Minute,
-		},
-		{
-			name:    "TZ-prefixed pattern respects half interval",
-			pattern: "TZ=UTC * * * * *", // 60s interval → half = 30s
+			name:    "TZ-prefixed pattern respects half remaining",
+			pattern: "TZ=UTC * * * * *",
 			jitter:  45 * time.Second,
 			wantMax: 30 * time.Second,
 		},
@@ -693,10 +739,46 @@ func TestClampedMaxJitter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := clampedMaxJitter(tt.pattern, tt.jitter, utc)
+			result := clampJitterToSchedule(tt.jitter, mustParse(t, tt.pattern), now)
 			require.Equal(t, tt.wantMax, result)
 		})
 	}
+
+	t.Run("nil schedule falls back to original jitter", func(t *testing.T) {
+		require.Equal(t, time.Minute, clampJitterToSchedule(time.Minute, nil, now))
+	})
+
+	t.Run("clamp varies with time until next firing", func(t *testing.T) {
+		// at 10:00:30 the next "* * * * *" firing is 30s away → half = 15s
+		lateNow := time.Date(2024, 1, 1, 10, 0, 30, 0, time.UTC)
+		require.Equal(t, 15*time.Second, clampJitterToSchedule(time.Minute, mustParse(t, "* * * * *"), lateNow))
+	})
+}
+
+// --- TestParseCronExpressionLocation ---
+
+func TestParseCronExpressionLocation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("TZ prefix determines firing instants", func(t *testing.T) {
+		sched, _, err := parseCronExpression("TZ=America/New_York 0 9 * * *", time.UTC)
+		require.NoError(t, err)
+		// 2024-01-15 12:00 UTC = 07:00 in New York (EST); next 9am NY = 14:00 UTC
+		from := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+		next := sched.Next(from)
+		require.Equal(t, time.Date(2024, 1, 15, 14, 0, 0, 0, time.UTC), next.UTC())
+	})
+
+	t.Run("default location determines firing instants", func(t *testing.T) {
+		tokyo, err := time.LoadLocation("Asia/Tokyo")
+		require.NoError(t, err)
+		sched, _, err := parseCronExpression("0 9 * * *", tokyo)
+		require.NoError(t, err)
+		// next 9am Tokyo (UTC+9) after 2024-01-15 12:00 UTC is 2024-01-16 00:00 UTC
+		from := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+		next := sched.Next(from)
+		require.Equal(t, time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC), next.UTC())
+	})
 }
 
 // --- TestSchedulerEndToEnd ---
@@ -792,4 +874,3 @@ func TestSchedulerEndToEnd(t *testing.T) {
 		})
 	}
 }
-

@@ -21,6 +21,9 @@ package main
 import (
 	"flag"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -113,12 +116,25 @@ func main() {
 
 	// Now let's start the controller
 	stop := make(chan struct{})
-	defer close(stop)
 	go deploymentController.Run(1, stop)
 	go statefulSetController.Run(1, stop)
 	go daemonSetController.Run(1, stop)
-	go scheduler.Run(stop)
 
-	// Wait forever
-	select {}
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		scheduler.Run(stop)
+	}()
+
+	// wait for SIGINT/SIGTERM, then shut down the controllers and scheduler
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+	close(stop)
+
+	// wait for the scheduler to finish stopping (it wakes any in-flight jitter
+	// sleeps and then waits for gocron to stop) before exiting
+	<-schedulerDone
+	logger.Info("shutdown complete")
 }

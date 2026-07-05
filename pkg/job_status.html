@@ -76,30 +76,48 @@ function timeUntil(dateStr) {
   return { text: text, overdue: overdue };
 }
 
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+var lastData = [];
+
+function render(data) {
+  var tbody = document.getElementById("tbody");
+  var filterText = document.getElementById("resourceFilter").value.toLowerCase();
+  if (filterText) {
+    data = data.filter(function(item) {
+      return item.resource.toLowerCase().indexOf(filterText) !== -1;
+    });
+  } else {
+    data = data.slice();
+  }
+  if (data.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No jobs scheduled</td></tr>';
+  } else {
+    var html = "";
+    data.sort(function(a, b) { return a.resource.localeCompare(b.resource) || a.cronPattern.localeCompare(b.cronPattern); });
+    for (var i = 0; i < data.length; i++) {
+      var d = data[i];
+      var tu = timeUntil(d.nextRun);
+      var style = tu.overdue ? ' style="color: red;"' : '';
+      html += "<tr><td>" + esc(d.resource) + "</td><td>" + esc(d.cronPattern) + "</td><td>" + esc(d.lastRun || "never") + "</td><td>" + esc(d.lastJitter || "none") + "</td><td>" + esc(d.nextRun) + "</td><td" + style + ">" + esc(tu.text) + "</td></tr>";
+    }
+    tbody.innerHTML = html;
+  }
+}
+
 function refresh() {
   fetch("/api/jobs")
     .then(function(r) { return r.json(); })
     .then(function(data) {
-      var tbody = document.getElementById("tbody");
-      var filterText = document.getElementById("resourceFilter").value.toLowerCase();
-      if (filterText) {
-        data = data.filter(function(item) {
-          return item.resource.toLowerCase().indexOf(filterText) !== -1;
-        });
-      }
-      if (data.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="empty">No jobs scheduled</td></tr>';
-      } else {
-        var html = "";
-        data.sort(function(a, b) { return a.resource.localeCompare(b.resource) || a.cronPattern.localeCompare(b.cronPattern); });
-        for (var i = 0; i < data.length; i++) {
-          var d = data[i];
-          var tu = timeUntil(d.nextRun);
-          var style = tu.overdue ? ' style="color: red;"' : '';
-          html += "<tr><td>" + d.resource + "</td><td>" + d.cronPattern + "</td><td>" + (d.lastRun || "never") + "</td><td>" + (d.lastJitter || "none") + "</td><td>" + d.nextRun + "</td><td" + style + ">" + tu.text + "</td></tr>";
-        }
-        tbody.innerHTML = html;
-      }
+      lastData = data;
+      render(lastData);
       document.getElementById("updated").textContent = "Last updated: " + new Date().toISOString();
     })
     .catch(function(err) {
@@ -122,12 +140,12 @@ document.getElementById("refreshInterval").addEventListener("change", scheduleRe
 var clearBtn = document.getElementById("clearFilter");
 document.getElementById("resourceFilter").addEventListener("input", function() {
   clearBtn.style.display = this.value ? "inline-block" : "none";
-  refresh();
+  render(lastData);
 });
 clearBtn.addEventListener("click", function() {
   document.getElementById("resourceFilter").value = "";
   clearBtn.style.display = "none";
-  refresh();
+  render(lastData);
 });
 fetch("/api/config")
   .then(function(r) { return r.json(); })
