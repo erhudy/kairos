@@ -72,6 +72,40 @@ func TestSynchronize(t *testing.T) {
 		require.Len(t, workchan, 1)
 		oasa := <-workchan
 		require.Equal(t, RESOURCE_DELETE, oasa.action)
+
+		// Verify the unannotated object was not stored in objectMap
+		_, loaded := c.objectMap.Load("default/no-cron")
+		require.False(t, loaded)
+	})
+
+	t.Run("annotation removal drops stashed object and sends RESOURCE_DELETE", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "losing-cron",
+				Namespace: "default",
+			},
+		}
+
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		err := indexer.Add(dep)
+		require.NoError(t, err)
+
+		workchan := make(chan ObjectAndSchedulerAction, 10)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+
+		// Pre-populate objectMap to simulate that the object was previously annotated
+		c.objectMap.Store("default/losing-cron", dep)
+
+		err = c.synchronize("default/losing-cron")
+		require.NoError(t, err)
+		require.Len(t, workchan, 1)
+		oasa := <-workchan
+		require.Equal(t, RESOURCE_DELETE, oasa.action)
+
+		// Verify the stale entry was removed from objectMap
+		_, loaded := c.objectMap.Load("default/losing-cron")
+		require.False(t, loaded)
 	})
 
 	t.Run("object deleted and found in objectMap sends RESOURCE_DELETE", func(t *testing.T) {
@@ -107,15 +141,14 @@ func TestSynchronize(t *testing.T) {
 		require.False(t, loaded)
 	})
 
-	t.Run("object deleted and not in objectMap returns error", func(t *testing.T) {
+	t.Run("object deleted and not in objectMap is a no-op", func(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
 		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
 
 		err := c.synchronize("default/nonexistent")
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "did not exist")
+		require.NoError(t, err)
 		require.Len(t, workchan, 0)
 	})
 
