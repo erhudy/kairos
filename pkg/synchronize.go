@@ -28,7 +28,8 @@ func (c *Controller) synchronize(key string) error {
 		if ok {
 			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: mapObj.(runtime.Object)}
 		} else {
-			return fmt.Errorf("synchronize was asked to delete object for key %s that did not exist", key)
+			// the object was never tracked (e.g. it lacked the cron annotation), so there is nothing to do
+			c.logger.Debug("object was not tracked, nothing to delete", zap.String("key", key))
 		}
 	} else {
 		// because of https://github.com/kubernetes/kubernetes/issues/80609 the GVK is purged on decode,
@@ -45,11 +46,6 @@ func (c *Controller) synchronize(key string) error {
 			return fmt.Errorf("got object of type %T in synchronize which should be impossible", obj)
 		}
 
-		// stash the runtime object in the object map so that we can pull it back out at delete time,
-		// because the object passed into the queue when deleted is nil and we can no longer retrieve the
-		// required information from it
-		c.objectMap.Store(key, obj)
-
 		// Note that you also have to check the uid if you have a local controlled resource, which
 		// is dependent on the actual instance, to detect that a Pod was recreated with the same name
 		// if err != nil {
@@ -58,13 +54,19 @@ func (c *Controller) synchronize(key string) error {
 		objm := obj.(metav1.ObjectMetaAccessor).GetObjectMeta()
 
 		if !careAboutThisObject(objm) {
-			// the annotation is gone; treat this as a delete so any previously scheduled
-			// restarts for this resource are cancelled (deleting jobs for an untracked
-			// resource is a no-op in the scheduler)
+			// drop any stashed object so unannotated resources don't accumulate in the map, and
+			// treat this as a delete so any previously scheduled restarts for this resource are
+			// cancelled (deleting jobs for an untracked resource is a no-op in the scheduler)
+			c.objectMap.Delete(key)
 			c.logger.Debug("don't care about object, cancelling any scheduled restarts", zap.String("namespace", objm.GetNamespace()), zap.String("name", objm.GetName()))
 			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: obj.(runtime.Object)}
 			return nil
 		}
+
+		// stash the runtime object in the object map so that we can pull it back out at delete time,
+		// because the object passed into the queue when deleted is nil and we can no longer retrieve the
+		// required information from it; only annotated objects are stashed to avoid unbounded growth
+		c.objectMap.Store(key, obj)
 
 		c.logger.Info("observed change for object", zap.String("key", key), zap.String("gvk", objk.GroupVersionKind().String()))
 		c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj.(runtime.Object)}
