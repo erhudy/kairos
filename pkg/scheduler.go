@@ -166,8 +166,8 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 	// load the cron patterns on the job
 	pattern := getCronPatternString(objm)
 	if pattern == "" {
-		s.logger.Debug("cron expression was empty", zap.String("resource", string(ri)))
-		return nil
+		s.logger.Debug("cron expression was empty, removing any registered jobs", zap.String("resource", string(ri)))
+		return s.deleteJobsForResource(obj)
 	}
 
 	splitPatternsRaw := strings.Split(strings.TrimSpace(strings.TrimSuffix(string(pattern), ";")), ";")
@@ -391,13 +391,14 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	objm, objk := getObjectMetaAndKind(obj)
 	ri := getResourceIdentifier(objm, objk)
 
-	s.logger.Info("deleting jobs for resource", zap.String("resource", string(ri)))
-
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
-		return fmt.Errorf("resource %s not found in resource map", ri)
+		s.logger.Debug("resource not found in resource map, nothing to delete", zap.String("resource", string(ri)))
+		return nil
 	}
 	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+
+	s.logger.Info("deleting jobs for resource", zap.String("resource", string(ri)))
 
 	entry.RLock()
 	jobsToDelete := make(map[cronPattern]*gocron.Job)
