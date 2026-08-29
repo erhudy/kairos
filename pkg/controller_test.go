@@ -51,7 +51,7 @@ func TestSynchronize(t *testing.T) {
 		require.True(t, loaded)
 	})
 
-	t.Run("object exists without cron annotation does not send to workchan", func(t *testing.T) {
+	t.Run("object exists without cron annotation sends RESOURCE_DELETE", func(t *testing.T) {
 		dep := &appsv1.Deployment{
 			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 			ObjectMeta: metav1.ObjectMeta{
@@ -69,7 +69,9 @@ func TestSynchronize(t *testing.T) {
 
 		err = c.synchronize("default/no-cron")
 		require.NoError(t, err)
-		require.Len(t, workchan, 0)
+		require.Len(t, workchan, 1)
+		oasa := <-workchan
+		require.Equal(t, RESOURCE_DELETE, oasa.action)
 	})
 
 	t.Run("object deleted and found in objectMap sends RESOURCE_DELETE", func(t *testing.T) {

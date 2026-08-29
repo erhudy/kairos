@@ -265,6 +265,63 @@ func TestReconcileJobsPatternChange(t *testing.T) {
 	require.False(t, has306, "expected pattern '30 6 * * *' to be removed")
 }
 
+func TestReconcileJobsAnnotationRemoved(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		testName    string
+		mutateAnnot func(dep *appsv1.Deployment)
+	}{
+		{
+			testName: "annotation removed entirely",
+			mutateAnnot: func(dep *appsv1.Deployment) {
+				delete(dep.Annotations, CRON_PATTERN_KEY)
+			},
+		},
+		{
+			testName: "annotation set to empty string",
+			mutateAnnot: func(dep *appsv1.Deployment) {
+				dep.Annotations[CRON_PATTERN_KEY] = ""
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			dep := &appsv1.Deployment{
+				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dep-remove",
+					Namespace: "ns1",
+					Annotations: map[string]string{
+						CRON_PATTERN_KEY: "0 0 * * *;30 12 * * *",
+					},
+				},
+			}
+			s, _ := newTestScheduler(t, dep)
+			s.cron.StartAsync()
+			defer s.cron.Stop()
+
+			err := s.reconcileJobsForResource(dep)
+			require.NoError(t, err)
+
+			om, ok := getObjectMetaAndKind(dep)
+			ri := getResourceIdentifier(om, ok)
+			raw, loaded := s.resourceMap.Load(ri)
+			require.True(t, loaded)
+			m := raw.(*resourceMapEntry)
+			require.Len(t, m.jobs, 2)
+
+			tt.mutateAnnot(dep)
+			err = s.reconcileJobsForResource(dep)
+			require.NoError(t, err)
+
+			_, loaded = s.resourceMap.Load(ri)
+			require.False(t, loaded, "expected all jobs removed when annotation is gone")
+		})
+	}
+}
+
 // --- TestCreateJob ---
 
 func TestCreateJob(t *testing.T) {
@@ -384,14 +441,13 @@ func TestDeleteJobsForResource(t *testing.T) {
 		require.False(t, loaded, "expected resource to be removed from resourceMap after delete")
 	})
 
-	t.Run("delete for nonexistent resource returns error", func(t *testing.T) {
+	t.Run("delete for nonexistent resource is a no-op", func(t *testing.T) {
 		s, _ := newTestScheduler(t)
 		s.cron.StartAsync()
 		defer s.cron.Stop()
 
 		err := s.deleteJobsForResource(dep)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "not found in resource map")
+		require.NoError(t, err)
 	})
 }
 

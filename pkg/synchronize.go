@@ -58,7 +58,11 @@ func (c *Controller) synchronize(key string) error {
 		objm := obj.(metav1.ObjectMetaAccessor).GetObjectMeta()
 
 		if !careAboutThisObject(objm) {
-			c.logger.Debug("don't care about object", zap.String("namespace", objm.GetNamespace()), zap.String("name", objm.GetName()))
+			// the annotation is gone; treat this as a delete so any previously scheduled
+			// restarts for this resource are cancelled (deleting jobs for an untracked
+			// resource is a no-op in the scheduler)
+			c.logger.Debug("don't care about object, cancelling any scheduled restarts", zap.String("namespace", objm.GetNamespace()), zap.String("name", objm.GetName()))
+			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: obj.(runtime.Object)}
 			return nil
 		}
 
