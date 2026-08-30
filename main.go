@@ -19,7 +19,10 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -96,16 +99,30 @@ func main() {
 
 	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback)
 
+	// listen synchronously so a bind failure fails fast before other components start;
+	// logger.Fatal here is safe because it runs on the main goroutine
+	listener, err := net.Listen("tcp", metricsAddr)
+	if err != nil {
+		logger.Fatal("unable to listen on metrics address", zap.String("addr", metricsAddr), zap.Error(err))
+	}
+
 	// start HTTP server (metrics + web UI)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/api/jobs", scheduler.JobStatusJSON)
 	mux.HandleFunc("/api/config", scheduler.ConfigJSON)
 	mux.HandleFunc("/", scheduler.JobStatusPage)
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		WriteTimeout:      20 * time.Second,
+	}
+	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("starting HTTP server", zap.String("addr", metricsAddr))
-		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
-			logger.Fatal("HTTP server failed", zap.Error(err))
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
 		}
 	}()
 
@@ -126,15 +143,32 @@ func main() {
 		scheduler.Run(stop)
 	}()
 
-	// wait for SIGINT/SIGTERM, then shut down the controllers and scheduler
+	// wait for SIGINT/SIGTERM (or an HTTP server failure), then shut everything down
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
-	logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+	httpFailed := false
+	select {
+	case sig := <-sigCh:
+		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+	case err := <-serverErr:
+		logger.Error("HTTP server failed, initiating shutdown", zap.Error(err))
+		httpFailed = true
+	}
 	close(stop)
+
+	// stop accepting new HTTP requests, giving in-flight ones a bounded grace period
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("error shutting down HTTP server", zap.Error(err))
+	}
 
 	// wait for the scheduler to finish stopping (it wakes any in-flight jitter
 	// sleeps and then waits for gocron to stop) before exiting
 	<-schedulerDone
 	logger.Info("shutdown complete")
+	if httpFailed {
+		_ = logger.Sync()
+		os.Exit(1)
+	}
 }
