@@ -246,7 +246,9 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		s.checkMissedRestart(patternsToAdd, obj)
 	}
 	for _, p := range patternsToDelete {
+		entry.RLock()
 		job := entry.jobs[p]
+		entry.RUnlock()
 		err := s.deleteJob(p, ri, job, obj)
 		if err != nil {
 			return fmt.Errorf("error while deleting job during reconcile: %w", err)
