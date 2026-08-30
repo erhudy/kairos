@@ -25,6 +25,9 @@ type Controller struct {
 	workchan     chan<- ObjectAndSchedulerAction
 	objectMap    *sync.Map
 	metrics      *KairosMetrics
+	// stopCh is set by Run; synchronize uses it to abandon waiting for a scheduler
+	// ack during shutdown instead of blocking its worker forever
+	stopCh <-chan struct{}
 }
 
 type cronPattern string
@@ -79,4 +82,8 @@ const (
 type ObjectAndSchedulerAction struct {
 	action SchedulerAction
 	obj    runtime.Object
+	// errCh is a buffered (size 1) channel on which the scheduler reports the
+	// result of processing this action so the controller can retry failures via
+	// its workqueue; nil means no ack is expected
+	errCh chan error
 }

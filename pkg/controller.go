@@ -89,6 +89,7 @@ func (c *Controller) Run(workers int, stopCh chan struct{}) {
 
 	// Let the workers stop when we are done
 	defer c.queue.ShutDown()
+	c.stopCh = stopCh
 	c.logger.Info("starting controller", zap.String("type", c.typename))
 
 	go c.informer.Run(stopCh)

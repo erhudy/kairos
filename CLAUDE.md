@@ -40,7 +40,9 @@ Kubernetes Informer (per resource type)
     → WorkQueue
     → synchronize() [pkg/synchronize.go]
         → checks for cron-pattern annotation
-        → sends ObjectAndSchedulerAction on channel
+        → sends ObjectAndSchedulerAction on channel (with an ack channel)
+        → waits for the scheduler's ack; a failed reconcile is returned so the
+          workqueue retries it (failed deletes keep the stashed object for retry)
     → Scheduler.run() [pkg/scheduler.go]
         → reconcileJobsForResource(): add/update/remove gocron jobs
         → checkMissedRestart(): with -lookback, one catch-up restart per resource
@@ -68,6 +70,6 @@ Kubernetes Informer (per resource type)
 
 - One goroutine per controller (3 total: Deployment, DaemonSet, StatefulSet)
 - One scheduler goroutine consuming the shared work channel
-- `sync.Map` for resource-to-jobs tracking, with a per-entry `sync.RWMutex` (`resourceMapEntry`) guarding each entry's jobs/lastJitters maps; channels for controller→scheduler communication
+- `sync.Map` for resource-to-jobs tracking, with a per-entry `sync.RWMutex` (`resourceMapEntry`) guarding each entry's jobs/lastJitters maps; channels for controller→scheduler communication, and a buffered ack channel on each action so the scheduler reports reconcile failures back to the waiting controller worker (the wait also selects on the controller's stopCh so shutdown isn't blocked by unacked actions)
 - gocron fires each job in its own goroutine; jitter sleeps select on the scheduler's shutdown context and re-check job registration afterward, so deleted jobs don't restart and shutdown isn't blocked
 - Controllers retry failed items up to 5 times with rate limiting
