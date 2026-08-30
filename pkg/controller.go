@@ -18,17 +18,16 @@ import (
 )
 
 // NewController creates a new Controller.
-func NewController(logger *zap.Logger, queue workqueue.TypedRateLimitingInterface[string], indexer cache.Store, informer cache.Controller, typespecimen runtime.Object, typename string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+func NewController(logger *zap.Logger, queue workqueue.TypedRateLimitingInterface[string], indexer cache.Store, informer cache.Controller, typename string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
 	return &Controller{
-		logger:       logger,
-		informer:     informer,
-		indexer:      indexer,
-		queue:        queue,
-		typespecimen: typespecimen,
-		typename:     typename,
-		workchan:     workchan,
-		objectMap:    &sync.Map{},
-		metrics:      metrics,
+		logger:    logger,
+		informer:  informer,
+		indexer:   indexer,
+		queue:     queue,
+		typename:  typename,
+		workchan:  workchan,
+		objectMap: &sync.Map{},
+		metrics:   metrics,
 	}
 }
 
@@ -168,5 +167,5 @@ func generateGenericController(logger *zap.Logger, restclient rest.Interface, na
 		Indexers: cache.Indexers{},
 	})
 
-	return NewController(logger, queue, store, informer, typespecimen, typename, workchan, metrics)
+	return NewController(logger, queue, store, informer, typename, workchan, metrics)
 }

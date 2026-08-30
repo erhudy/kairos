@@ -64,7 +64,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		oasa, err := syncWithAck(t, workchan, c, "default/my-dep", nil)
 		require.NoError(t, err)
@@ -89,7 +89,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		oasa, err := syncWithAck(t, workchan, c, "default/no-cron", nil)
 		require.NoError(t, err)
@@ -114,7 +114,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		// Pre-populate objectMap to simulate that the object was previously annotated
 		c.objectMap.Store("default/losing-cron", dep)
@@ -144,7 +144,7 @@ func TestSynchronize(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		// Pre-populate objectMap to simulate that we previously saw this object
 		c.objectMap.Store("default/deleted-dep", dep)
@@ -163,7 +163,7 @@ func TestSynchronize(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		err := c.synchronize("default/nonexistent")
 		require.NoError(t, err)
@@ -173,7 +173,7 @@ func TestSynchronize(t *testing.T) {
 	t.Run("indexer returns error", func(t *testing.T) {
 		workchan := make(chan ObjectAndSchedulerAction, 10)
 		fi := &fakeErrorIndexer{err: fmt.Errorf("indexer failure")}
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), fi, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), fi, nil, "deployments", workchan, nil)
 
 		err := c.synchronize("default/anything")
 		require.Error(t, err)
@@ -198,7 +198,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.DaemonSet{}, "daemonsets", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "daemonsets", workchan, nil)
 
 		oasa, err := syncWithAck(t, workchan, c, "kube-system/my-ds", nil)
 		require.NoError(t, err)
@@ -224,7 +224,7 @@ func TestSynchronize(t *testing.T) {
 		require.NoError(t, err)
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.StatefulSet{}, "statefulsets", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "statefulsets", workchan, nil)
 
 		oasa, err := syncWithAck(t, workchan, c, "prod/my-ss", nil)
 		require.NoError(t, err)
@@ -254,7 +254,7 @@ func TestSynchronizeAckPropagation(t *testing.T) {
 		require.NoError(t, indexer.Add(annotatedDep("flaky")))
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		oasa, err := syncWithAck(t, workchan, c, "default/flaky", fmt.Errorf("gocron exploded"))
 		require.Error(t, err)
@@ -265,7 +265,7 @@ func TestSynchronizeAckPropagation(t *testing.T) {
 	t.Run("failed delete keeps the stashed object for retry", func(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		c.objectMap.Store("default/gone", annotatedDep("gone"))
 
@@ -282,7 +282,7 @@ func TestSynchronizeAckPropagation(t *testing.T) {
 	t.Run("successful delete removes the stashed object", func(t *testing.T) {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		c.objectMap.Store("default/gone2", annotatedDep("gone2"))
 
@@ -298,7 +298,7 @@ func TestSynchronizeAckPropagation(t *testing.T) {
 		require.NoError(t, indexer.Add(annotatedDep("hang")))
 
 		workchan := make(chan ObjectAndSchedulerAction, 10)
-		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, &appsv1.Deployment{}, "deployments", workchan, nil)
+		c := NewController(zap.NewNop(), workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()), indexer, nil, "deployments", workchan, nil)
 
 		stopCh := make(chan struct{})
 		close(stopCh)

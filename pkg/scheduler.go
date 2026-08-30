@@ -246,7 +246,9 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		s.checkMissedRestart(patternsToAdd, obj)
 	}
 	for _, p := range patternsToDelete {
+		entry.RLock()
 		job := entry.jobs[p]
+		entry.RUnlock()
 		err := s.deleteJob(p, ri, job, obj)
 		if err != nil {
 			return fmt.Errorf("error while deleting job during reconcile: %w", err)
@@ -297,14 +299,14 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 		expectedCountForCronWithSeconds += 1
 	}
 
-	l := len(strings.Split(cpString, " "))
+	l := len(strings.Fields(cpString))
 	switch l {
 	case expectedCountForCron:
 		cronFunc = s.cron.Cron
 	case expectedCountForCronWithSeconds:
 		cronFunc = s.cron.CronWithSeconds
 	default:
-		return fmt.Errorf("got %d fields splitting cron expression '%s', expected 5 or 6", l, cp)
+		return fmt.Errorf("got %d fields in cron expression '%s', expected %d or %d", l, cp, expectedCountForCron, expectedCountForCronWithSeconds)
 	}
 
 	tag := fmt.Sprintf("%s--%s", ri, cp)
@@ -413,18 +415,22 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	}
 	entry.RUnlock()
 
+	var errs []error
 	for cronPattern, job := range jobsToDelete {
 		err := s.deleteJob(cronPattern, ri, job, obj)
 		if err != nil {
-			return err
+			s.logger.Error("error deleting job for resource", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cronPattern)), zap.Error(err))
+			errs = append(errs, fmt.Errorf("deleting job %s: %w", cronPattern, err))
 		}
 	}
 
+	// remove the entry and decrement the gauge even if some deletions failed,
+	// so a partial failure does not wedge the resource against future re-adds
 	s.resourceMap.Delete(ri)
 	if s.metrics != nil {
 		s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Dec()
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job, obj runtime.Object) error {
@@ -593,6 +599,11 @@ func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, 
 	go func() {
 		if s.maxJitter > 0 {
 			if !s.sleepWithJitter(missedPattern, ri, missedSchedule) {
+				return
+			}
+			// the job may have been deleted while we slept; do not restart if so
+			if !s.jobStillRegistered(missedPattern, ri) {
+				s.logger.Info("job removed during jitter sleep, skipping catch-up restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(missedPattern)))
 				return
 			}
 		}
