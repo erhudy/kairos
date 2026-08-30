@@ -17,9 +17,9 @@ import (
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -623,76 +623,12 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 
 	start := time.Now()
 	now := start.Format(LAST_RESTARTED_AT_TIME_FORMAT)
-	var err error
 
-	const maxRetries = 5
+	ctx, cancel := context.WithTimeout(ctx, API_CALL_TIMEOUT)
+	defer cancel()
 
-	switch incomingObject.(type) {
-	case *appsv1.Deployment:
-		for range maxRetries {
-			var obj *appsv1.Deployment
-			obj, err = clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
-				logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
-				if metrics != nil {
-					metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
-				}
-				return
-			}
-			if obj.Spec.Template.Annotations == nil {
-				obj.Spec.Template.Annotations = make(map[string]string)
-			}
-			obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
-			_, err = clientset.AppsV1().Deployments(namespace).Update(ctx, obj, metav1.UpdateOptions{})
-			if err == nil || !k8serrors.IsConflict(err) {
-				break
-			}
-			logger.Warn("conflict updating object in restartFunc, retrying", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
-		}
-	case *appsv1.DaemonSet:
-		for range maxRetries {
-			var obj *appsv1.DaemonSet
-			obj, err = clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
-				logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
-				if metrics != nil {
-					metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
-				}
-				return
-			}
-			if obj.Spec.Template.Annotations == nil {
-				obj.Spec.Template.Annotations = make(map[string]string)
-			}
-			obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
-			_, err = clientset.AppsV1().DaemonSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
-			if err == nil || !k8serrors.IsConflict(err) {
-				break
-			}
-			logger.Warn("conflict updating object in restartFunc, retrying", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
-		}
-	case *appsv1.StatefulSet:
-		for range maxRetries {
-			var obj *appsv1.StatefulSet
-			obj, err = clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-			if err != nil {
-				logger.Error("error getting object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
-				if metrics != nil {
-					metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "get").Inc()
-				}
-				return
-			}
-			if obj.Spec.Template.Annotations == nil {
-				obj.Spec.Template.Annotations = make(map[string]string)
-			}
-			obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] = now
-			_, err = clientset.AppsV1().StatefulSets(namespace).Update(ctx, obj, metav1.UpdateOptions{})
-			if err == nil || !k8serrors.IsConflict(err) {
-				break
-			}
-			logger.Warn("conflict updating object in restartFunc, retrying", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name))
-		}
-	default:
-		logger.Error("unsupported type in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)))
+	supported, err := patchPodTemplateAnnotation(ctx, logger, clientset, incomingObject, CRON_LAST_RESTARTED_AT_KEY, now)
+	if !supported {
 		return
 	}
 
@@ -701,13 +637,49 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 	}
 
 	if err != nil {
-		logger.Error("error updating object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
+		logger.Error("error patching object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
 		if metrics != nil {
-			metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "update").Inc()
+			metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "patch").Inc()
 		}
 	} else {
 		if metrics != nil {
 			metrics.RestartTotal.WithLabelValues(kind, namespace, name).Inc()
 		}
 	}
+}
+
+// patchPodTemplateAnnotation sets a single annotation on the workload's pod template via a
+// JSON merge patch, so concurrent edits to other fields are not clobbered and no
+// conflict-retry loop is needed. The bool reports whether the object type is supported.
+func patchPodTemplateAnnotation(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, obj runtime.Object, key, value string) (bool, error) {
+	payload, err := json.Marshal(map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"metadata": map[string]any{
+					"annotations": map[string]string{key: value},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return false, fmt.Errorf("error building patch payload: %w", err)
+	}
+
+	om, _ := getObjectMetaAndKind(obj)
+	namespace := om.GetNamespace()
+	name := om.GetName()
+	opts := metav1.PatchOptions{}
+
+	switch obj.(type) {
+	case *appsv1.Deployment:
+		_, err = clientset.AppsV1().Deployments(namespace).Patch(ctx, name, types.MergePatchType, payload, opts)
+	case *appsv1.DaemonSet:
+		_, err = clientset.AppsV1().DaemonSets(namespace).Patch(ctx, name, types.MergePatchType, payload, opts)
+	case *appsv1.StatefulSet:
+		_, err = clientset.AppsV1().StatefulSets(namespace).Patch(ctx, name, types.MergePatchType, payload, opts)
+	default:
+		logger.Error("unsupported type in restartFunc", zap.String("type", fmt.Sprintf("%T", obj)))
+		return false, nil
+	}
+	return true, err
 }

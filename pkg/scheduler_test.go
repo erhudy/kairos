@@ -791,7 +791,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		updates := 0
 		for _, action := range clientset.Actions() {
-			if action.GetVerb() == "update" && action.GetResource().Resource == "deployments" {
+			if action.GetVerb() == "patch" && action.GetResource().Resource == "deployments" {
 				updates++
 			}
 		}
