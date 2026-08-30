@@ -746,6 +746,31 @@ func TestCheckMissedRestart(t *testing.T) {
 		require.False(t, hasAnn)
 	})
 
+	t.Run("no catch-up restart when job is deleted during jitter sleep", func(t *testing.T) {
+		dep := makeDeployment("")
+		clientset := fake.NewClientset(dep)
+		tz, err := time.LoadLocation("")
+		require.NoError(t, err)
+		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		om, kind := getObjectMetaAndKind(dep)
+		ri := getResourceIdentifier(om, kind)
+		require.NoError(t, s.createJob("0 * * * *", ri, dep))
+
+		s.checkMissedRestartAt([]cronPattern{"0 * * * *"}, dep, now)
+		// deregister immediately; the catch-up goroutine is still inside its jitter sleep
+		require.NoError(t, s.deleteJobsForResource(dep))
+
+		time.Sleep(1500 * time.Millisecond)
+
+		obj, err := clientset.AppsV1().Deployments("ns1").Get(context.TODO(), "test-dep", metav1.GetOptions{})
+		require.NoError(t, err)
+		_, hasAnn := obj.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY]
+		require.False(t, hasAnn, "expected no restart after job was deregistered during jitter sleep")
+	})
+
 	t.Run("multiple missed patterns trigger only one restart", func(t *testing.T) {
 		dep := makeDeployment("")
 		s, clientset := newTestSchedulerWithLookback(t, 30*time.Minute, dep)

@@ -601,6 +601,11 @@ func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, 
 			if !s.sleepWithJitter(missedPattern, ri, missedSchedule) {
 				return
 			}
+			// the job may have been deleted while we slept; do not restart if so
+			if !s.jobStillRegistered(missedPattern, ri) {
+				s.logger.Info("job removed during jitter sleep, skipping catch-up restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(missedPattern)))
+				return
+			}
 		}
 		restartFunc(context.Background(), s.logger, s.clientset, obj, s.metrics)
 	}()
