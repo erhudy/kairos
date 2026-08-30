@@ -16,15 +16,14 @@ import (
 
 // Controller demonstrates how to implement a controller with client-go.
 type Controller struct {
-	logger       *zap.Logger
-	indexer      cache.Store
-	queue        workqueue.TypedRateLimitingInterface[string]
-	informer     cache.Controller
-	typespecimen runtime.Object
-	typename     string
-	workchan     chan<- ObjectAndSchedulerAction
-	objectMap    *sync.Map
-	metrics      *KairosMetrics
+	logger    *zap.Logger
+	indexer   cache.Store
+	queue     workqueue.TypedRateLimitingInterface[string]
+	informer  cache.Controller
+	typename  string
+	workchan  chan<- ObjectAndSchedulerAction
+	objectMap *sync.Map
+	metrics   *KairosMetrics
 	// stopCh is set by Run; synchronize uses it to abandon waiting for a scheduler
 	// ack during shutdown instead of blocking its worker forever
 	stopCh <-chan struct{}
