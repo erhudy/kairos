@@ -366,6 +366,14 @@ func TestCreateJob(t *testing.T) {
 			pattern:  cronPattern("TZ=UTC 0 0 0 * * *"),
 		},
 		{
+			testName: "double spaces between fields",
+			pattern:  cronPattern("0  0 *  * *"),
+		},
+		{
+			testName: "tabs between fields",
+			pattern:  cronPattern("0\t0\t* * *"),
+		},
+		{
 			testName:  "invalid field count (4 fields)",
 			pattern:   cronPattern("0 0 * *"),
 			expectErr: true,
