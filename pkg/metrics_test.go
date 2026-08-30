@@ -51,13 +51,11 @@ func TestRestartFuncIncrementsMetrics(t *testing.T) {
 	require.True(t, durationFound, "expected restart duration histogram to have observations")
 
 	// Verify no error counters were incremented
-	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "metric-dep", "get"))
-	require.Equal(t, float64(0), errCount)
-	errCount = testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "metric-dep", "update"))
+	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "metric-dep", "patch"))
 	require.Equal(t, float64(0), errCount)
 }
 
-func TestRestartFuncGetErrorIncrementsErrorMetric(t *testing.T) {
+func TestRestartFuncPatchErrorIncrementsErrorMetric(t *testing.T) {
 	t.Parallel()
 
 	dep := &appsv1.Deployment{
@@ -65,7 +63,7 @@ func TestRestartFuncGetErrorIncrementsErrorMetric(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "nonexistent", Namespace: "ns1"},
 	}
 
-	// Empty clientset — Get will fail with not found
+	// Empty clientset — Patch will fail with not found
 	clientset := fake.NewClientset()
 	logger := zap.NewNop()
 
@@ -75,8 +73,8 @@ func TestRestartFuncGetErrorIncrementsErrorMetric(t *testing.T) {
 
 	restartFunc(context.Background(), logger, clientset, dep, metrics)
 
-	// Verify get error counter was incremented
-	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "nonexistent", "get"))
+	// Verify patch error counter was incremented
+	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "nonexistent", "patch"))
 	require.Equal(t, float64(1), errCount)
 
 	// Verify restart counter was NOT incremented
