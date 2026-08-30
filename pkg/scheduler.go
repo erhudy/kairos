@@ -415,18 +415,22 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	}
 	entry.RUnlock()
 
+	var errs []error
 	for cronPattern, job := range jobsToDelete {
 		err := s.deleteJob(cronPattern, ri, job, obj)
 		if err != nil {
-			return err
+			s.logger.Error("error deleting job for resource", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cronPattern)), zap.Error(err))
+			errs = append(errs, fmt.Errorf("deleting job %s: %w", cronPattern, err))
 		}
 	}
 
+	// remove the entry and decrement the gauge even if some deletions failed,
+	// so a partial failure does not wedge the resource against future re-adds
 	s.resourceMap.Delete(ri)
 	if s.metrics != nil {
 		s.metrics.TrackedResources.WithLabelValues(kindFromObject(obj)).Dec()
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job, obj runtime.Object) error {
