@@ -49,6 +49,48 @@ spec:
           command: ["sleep", "infinity"]
 ---
 apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: erhudy-test-daemonset-every-minute
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/cron-pattern: "* * * * *"
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-daemonset-every-minute
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-daemonset-every-minute
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-unannotated
+  namespace: namespace-1
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-unannotated
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-unannotated
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: erhudy-test-every-four-minutes
