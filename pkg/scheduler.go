@@ -143,17 +143,23 @@ func (s *Scheduler) JobStatusPage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Scheduler) processSchedulerBundle(action ObjectAndSchedulerAction) {
 	// action here refers to what is happening to the owning Deployment/DaemonSet/StatefulSet, not what is happening with the cron jobs
+	var err error
 	switch action.action {
 	case RESOURCE_DELETE:
-		err := s.deleteJobsForResource(action.obj)
+		err = s.deleteJobsForResource(action.obj)
 		if err != nil {
 			s.logger.Error("error removing job from scheduler", zap.Error(err))
 		}
 	case RESOURCE_CHANGE:
-		err := s.reconcileJobsForResource(action.obj)
+		err = s.reconcileJobsForResource(action.obj)
 		if err != nil {
 			s.logger.Error("error reconciling jobs", zap.Error(err))
 		}
+	}
+	// ack the action so the controller can retry failures via its workqueue;
+	// errCh is buffered (size 1), so this never blocks even if the sender gave up
+	if action.errCh != nil {
+		action.errCh <- err
 	}
 }
 

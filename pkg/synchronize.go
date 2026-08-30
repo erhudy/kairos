@@ -10,9 +10,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// synchronize is the business logic of the controller. In this controller it simply prints
-// information about the pod to stdout. In case an error happened, it has to simply return the error.
-// The retry logic should not be part of the business logic.
+// awaitSchedulerAck waits for the scheduler to report the result of an action so
+// failures can be retried via the workqueue. It returns nil if the controller is
+// shutting down before an ack arrives.
+func (c *Controller) awaitSchedulerAck(errCh chan error) error {
+	select {
+	case err := <-errCh:
+		return err
+	case <-c.stopCh:
+		return nil
+	}
+}
+
+// synchronize is the business logic of the controller. In case an error happened, it has to simply return the error.
+// The retry logic should not be part of the business logic. Errors reported by the scheduler via the action's ack
+// channel are propagated here so that failed reconciles are retried instead of being swallowed.
 func (c *Controller) synchronize(key string) error {
 	c.logger.Debug("synchronize loading key", zap.String("key", key))
 	obj, exists, err := c.indexer.GetByKey(key)
@@ -24,9 +36,15 @@ func (c *Controller) synchronize(key string) error {
 	if !exists {
 		c.logger.Debug("object does not exist anymore", zap.String("key", key))
 
-		mapObj, ok := c.objectMap.LoadAndDelete(key)
+		mapObj, ok := c.objectMap.Load(key)
 		if ok {
-			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: mapObj.(runtime.Object)}
+			errCh := make(chan error, 1)
+			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: mapObj.(runtime.Object), errCh: errCh}
+			if ackErr := c.awaitSchedulerAck(errCh); ackErr != nil {
+				// keep the stashed object so a retry can re-attempt the delete
+				return fmt.Errorf("error deleting jobs for %s: %w", key, ackErr)
+			}
+			c.objectMap.Delete(key)
 		} else {
 			// the object was never tracked (e.g. it lacked the cron annotation), so there is nothing to do
 			c.logger.Debug("object was not tracked, nothing to delete", zap.String("key", key))
@@ -59,7 +77,11 @@ func (c *Controller) synchronize(key string) error {
 			// cancelled (deleting jobs for an untracked resource is a no-op in the scheduler)
 			c.objectMap.Delete(key)
 			c.logger.Debug("don't care about object, cancelling any scheduled restarts", zap.String("namespace", objm.GetNamespace()), zap.String("name", objm.GetName()))
-			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: obj.(runtime.Object)}
+			errCh := make(chan error, 1)
+			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: obj.(runtime.Object), errCh: errCh}
+			if ackErr := c.awaitSchedulerAck(errCh); ackErr != nil {
+				return fmt.Errorf("error cancelling scheduled restarts for %s: %w", key, ackErr)
+			}
 			return nil
 		}
 
@@ -69,7 +91,11 @@ func (c *Controller) synchronize(key string) error {
 		c.objectMap.Store(key, obj)
 
 		c.logger.Info("observed change for object", zap.String("key", key), zap.String("gvk", objk.GroupVersionKind().String()))
-		c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj.(runtime.Object)}
+		errCh := make(chan error, 1)
+		c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj.(runtime.Object), errCh: errCh}
+		if ackErr := c.awaitSchedulerAck(errCh); ackErr != nil {
+			return fmt.Errorf("error reconciling jobs for %s: %w", key, ackErr)
+		}
 	}
 	return nil
 }
