@@ -428,29 +428,32 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 }
 
 func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job, obj runtime.Object) error {
+	notFound := false
 	err := s.cron.RemoveByID(job)
-	if err != nil {
-		if !errors.Is(err, gocron.ErrJobNotFound) {
-			return fmt.Errorf("error in deleteJob: %w", err)
-		}
-	} else {
-		registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
-		if !ok {
-			return fmt.Errorf("resource %s not found in resource map", ri)
-		}
-		entry := registeredJobsForResourceRaw.(*resourceMapEntry)
-		entry.Lock()
-		delete(entry.jobs, cp)
-		delete(entry.lastJitters, cp)
-		entry.Unlock()
-		s.logger.Info(
-			"deleted job",
-			zap.String("resource", string(ri)),
-			zap.String("cron-pattern", string(cp)),
-		)
-		if s.metrics != nil {
-			s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Dec()
-		}
+	if err != nil && !errors.Is(err, gocron.ErrJobNotFound) {
+		return fmt.Errorf("error in deleteJob: %w", err)
+	} else if err != nil {
+		notFound = true
+	}
+	// A "not found" result means the desired end state is already reached,
+	// so map/gauge cleanup happens regardless of whether removal succeeded.
+	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
+	if !ok {
+		return fmt.Errorf("resource %s not found in resource map", ri)
+	}
+	entry := registeredJobsForResourceRaw.(*resourceMapEntry)
+	entry.Lock()
+	delete(entry.jobs, cp)
+	delete(entry.lastJitters, cp)
+	entry.Unlock()
+	s.logger.Info(
+		"deleted job",
+		zap.String("resource", string(ri)),
+		zap.String("cron-pattern", string(cp)),
+		zap.Bool("job-not-found", notFound),
+	)
+	if s.metrics != nil {
+		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Dec()
 	}
 	return nil
 }

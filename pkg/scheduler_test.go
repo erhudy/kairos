@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-co-op/gocron"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -448,6 +450,42 @@ func TestDeleteJobsForResource(t *testing.T) {
 
 		err := s.deleteJobsForResource(dep)
 		require.NoError(t, err)
+	})
+
+	t.Run("deleteJob cleans up map entry and gauge on ErrJobNotFound", func(t *testing.T) {
+		clientset := fake.NewClientset(dep)
+		tz, err := time.LoadLocation("")
+		require.NoError(t, err)
+		metrics := NewKairosMetrics()
+		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		om, ok := getObjectMetaAndKind(dep)
+		ri := getResourceIdentifier(om, ok)
+
+		// Simulate a stale entry: job tracked in the map but already gone from gocron.
+		cp := cronPattern("0 0 * * *")
+		entry := &resourceMapEntry{
+			obj:         dep,
+			jobs:        map[cronPattern]*gocron.Job{cp: {}},
+			lastJitters: map[cronPattern]time.Duration{cp: time.Second},
+		}
+		s.resourceMap.Store(ri, entry)
+		metrics.ScheduledJobs.WithLabelValues("Deployment").Inc()
+
+		err = s.deleteJob(cp, ri, &gocron.Job{}, dep)
+		require.NoError(t, err)
+
+		entry.RLock()
+		_, jobExists := entry.jobs[cp]
+		_, jitterExists := entry.lastJitters[cp]
+		entry.RUnlock()
+		require.False(t, jobExists, "expected stale job entry to be removed on ErrJobNotFound")
+		require.False(t, jitterExists, "expected stale jitter entry to be removed on ErrJobNotFound")
+
+		require.Zero(t, testutil.ToFloat64(metrics.ScheduledJobs.WithLabelValues("Deployment")),
+			"expected ScheduledJobs gauge not to drift on ErrJobNotFound")
 	})
 }
 
