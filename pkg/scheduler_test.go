@@ -32,7 +32,17 @@ func newTestSchedulerWithLookback(t *testing.T, lookback time.Duration, objects 
 	tz, err := time.LoadLocation("")
 	require.NoError(t, err)
 	ch := make(chan ObjectAndSchedulerAction, 10)
-	s := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback)
+	s := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback, 10*time.Minute)
+	return s, clientset
+}
+
+// newTestSchedulerWithChain creates a Scheduler with chain support tuned for
+// fast unit tests: short timeout and health-poll interval.
+func newTestSchedulerWithChain(t *testing.T, chainTimeout time.Duration, objects ...runtime.Object) (*Scheduler, *fake.Clientset) {
+	t.Helper()
+	s, clientset := newTestSchedulerWithLookback(t, 0, objects...)
+	s.chainTimeout = chainTimeout
+	s.chainPollInterval = 10 * time.Millisecond
 	return s, clientset
 }
 
@@ -465,7 +475,7 @@ func TestDeleteJobsForResource(t *testing.T) {
 		tz, err := time.LoadLocation("")
 		require.NoError(t, err)
 		metrics := NewKairosMetrics()
-		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0)
+		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0, 10*time.Minute)
 		s.cron.StartAsync()
 		defer s.cron.Stop()
 
@@ -751,7 +761,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		clientset := fake.NewClientset(dep)
 		tz, err := time.LoadLocation("")
 		require.NoError(t, err)
-		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute)
+		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute, 10*time.Minute)
 		s.cron.StartAsync()
 		defer s.cron.Stop()
 

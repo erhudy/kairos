@@ -12,6 +12,7 @@ type KairosMetrics struct {
 	ScheduledJobs      *prometheus.GaugeVec
 	QueueDepth         *prometheus.GaugeVec
 	SyncErrorsTotal    *prometheus.CounterVec
+	ChainStepsTotal    *prometheus.CounterVec
 }
 
 func NewKairosMetrics() *KairosMetrics {
@@ -45,6 +46,10 @@ func NewKairosMetrics() *KairosMetrics {
 			Name: "kairos_sync_errors_total",
 			Help: "Total number of sync errors after exhausting retries",
 		}, []string{"kind"}),
+		ChainStepsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kairos_chain_steps_total",
+			Help: "Total number of chained restart steps by outcome (completed|timeout|aborted)",
+		}, []string{"kind", "namespace", "name", "outcome"}),
 	}
 }
 
@@ -57,5 +62,6 @@ func (m *KairosMetrics) Register(reg prometheus.Registerer) {
 		m.ScheduledJobs,
 		m.QueueDepth,
 		m.SyncErrorsTotal,
+		m.ChainStepsTotal,
 	)
 }
