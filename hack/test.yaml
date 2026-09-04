@@ -269,7 +269,8 @@ spec:
       containers:
         - name: erhudy-test
           image: alpine:latest
-          command: ["sleep", "infinity"]---
+          command: ["sleep", "infinity"]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
