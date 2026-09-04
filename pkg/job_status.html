@@ -17,6 +17,7 @@
   tr:hover { background: #f9f9f9; }
   .empty { padding: 2rem; text-align: center; color: #888; }
   .badge { display: inline-block; background: #e8f0fe; color: #1a56b0; border-radius: 3px; padding: 0.1rem 0.4rem; font-size: 0.75rem; font-weight: 600; }
+  .badge-chained { background: #f0f0f4; color: #666; }
 </style>
 </head>
 <body>
@@ -53,6 +54,7 @@
     <tr>
       <th>Resource</th>
       <th>Cron Pattern</th>
+      <th>Restarts After</th>
       <th>Last Restart</th>
       <th>Last Jitter</th>
       <th>Next Scheduled Restart</th>
@@ -100,15 +102,24 @@ function render(data) {
     data = data.slice();
   }
   if (data.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">No jobs scheduled</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">No jobs scheduled</td></tr>';
   } else {
     var html = "";
     data.sort(function(a, b) { return a.resource.localeCompare(b.resource) || a.cronPattern.localeCompare(b.cronPattern); });
     for (var i = 0; i < data.length; i++) {
       var d = data[i];
+      var chained = !d.cronPattern && d.restartAfter;
       var tu = timeUntil(d.nextRun);
       var style = tu.overdue ? ' style="color: red;"' : '';
-      html += "<tr><td>" + esc(d.resource) + "</td><td>" + esc(d.cronPattern) + "</td><td>" + esc(d.lastRun || "never") + "</td><td>" + esc(d.lastJitter || "none") + "</td><td>" + esc(d.nextRun) + "</td><td" + style + ">" + esc(tu.text) + "</td></tr>";
+      var cronCell = chained ? '<span class="badge badge-chained">chained</span>' : esc(d.cronPattern);
+      var afterText = "";
+      if (d.restartAfter) {
+        afterText = d.restartAfter + " · " + (d.restartAfterMode || "health");
+        if (d.restartAfterWait) afterText += " " + d.restartAfterWait;
+      }
+      var nextRunCell = chained ? "—" : esc(d.nextRun);
+      var tuCell = chained ? "<td>—</td>" : '<td' + style + ">" + esc(tu.text) + "</td>";
+      html += "<tr><td>" + esc(d.resource) + "</td><td>" + cronCell + "</td><td>" + esc(afterText) + "</td><td>" + esc(d.lastRun || "never") + "</td><td>" + esc(d.lastJitter || "none") + "</td><td>" + nextRunCell + "</td>" + tuCell + "</tr>";
     }
     tbody.innerHTML = html;
   }
@@ -155,6 +166,7 @@ fetch("/api/config")
     document.getElementById("cfgTimezone").textContent = cfg.timezone;
     document.getElementById("cfgJitter").textContent = cfg.jitter;
     document.getElementById("cfgLookback").textContent = cfg.lookback;
+    document.getElementById("cfgChainTimeout").textContent = cfg.chainTimeout;
   })
   .catch(function(err) { console.error("error fetching config:", err); });
 refresh();
@@ -168,10 +180,10 @@ setInterval(function() {
   var rows = document.getElementById("tbody").querySelectorAll("tr");
   for (var i = 0; i < rows.length; i++) {
     var cells = rows[i].querySelectorAll("td");
-    if (cells.length === 6 && cells[4].textContent && cells[4].textContent !== "") {
-      var tu = timeUntil(cells[4].textContent);
-      cells[5].textContent = tu.text;
-      cells[5].style.color = tu.overdue ? "red" : "";
+    if (cells.length === 7 && cells[5].textContent && cells[5].textContent !== "—") {
+      var tu = timeUntil(cells[5].textContent);
+      cells[6].textContent = tu.text;
+      cells[6].style.color = tu.overdue ? "red" : "";
     }
   }
 }, 1000);

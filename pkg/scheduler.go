@@ -706,13 +706,12 @@ func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, 
 
 // fireRestart patches the pod template annotation on obj and, when the patch
 // succeeds, triggers any chained followers registered for it.
-func (s *Scheduler) fireRestart(obj runtime.Object) bool {
+func (s *Scheduler) fireRestart(obj runtime.Object) {
 	if !restartFunc(context.Background(), s.logger, s.clientset, obj, s.metrics) {
-		return false
+		return
 	}
 	om, objk := getObjectMetaAndKind(obj)
 	s.triggerFollowers(getResourceIdentifier(om, objk))
-	return true
 }
 
 // triggerFollowers spawns one chain step per follower registered under predRi,
@@ -863,10 +862,7 @@ func (s *Scheduler) chainSettleWait(edge *chainEdge, predRi resourceIdentifier) 
 	case <-s.shutdownCtx.Done():
 		return false
 	}
-	if !s.edgeStillRegistered(predRi, edge.followerRi) {
-		return false
-	}
-	return true
+	return s.edgeStillRegistered(predRi, edge.followerRi)
 }
 
 func (s *Scheduler) getWorkload(ref workloadRef) (runtime.Object, error) {

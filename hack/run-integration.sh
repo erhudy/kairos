@@ -50,7 +50,7 @@ export KAIROS_BIN="$BIN"
 echo "applying test.yaml"
 kubectl apply -f "$REPO_ROOT/hack/test.yaml" >/dev/null
 
-echo "running integration tests (~15 min)"
+echo "running integration tests (~20 min)"
 # on hosts with aggressive sleep settings (e.g. `pmset -c sleep 1`) boundary windows
 # may still be interrupted; consider `sudo pmset -c sleep 0` for a reliable run.
 cd "$REPO_ROOT"

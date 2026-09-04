@@ -269,4 +269,117 @@ spec:
       containers:
         - name: erhudy-test
           image: alpine:latest
+          command: ["sleep", "infinity"]---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-chain-head
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/cron-pattern: "* * * * *"
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-chain-head
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-chain-head
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: erhudy-test-chain-mid
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/restart-after: deployment/erhudy-test-chain-head
+    kairos.erhudy.com/restart-after-mode: health
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-chain-mid
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-chain-mid
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-chain-tail
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/restart-after: statefulset/erhudy-test-chain-mid
+    kairos.erhudy.com/restart-after-mode: health-plus-wait
+    kairos.erhudy.com/restart-after-wait: 30s
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-chain-tail
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-chain-tail
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-chain-stuck
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/restart-after: deployment/erhudy-test-chain-head
+    kairos.erhudy.com/restart-after-mode: health
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-chain-stuck
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-chain-stuck
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: example.invalid/kairos-never-ready:latest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-chain-blocked
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/restart-after: deployment/erhudy-test-chain-stuck
+    kairos.erhudy.com/restart-after-mode: health
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-chain-blocked
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-chain-blocked
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
           command: ["sleep", "infinity"]
