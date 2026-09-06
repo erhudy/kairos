@@ -28,6 +28,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	// -timezone and TZ=-prefixed patterns need zoneinfo at runtime; embedding it
+	// keeps them working if the base image ever stops shipping tzdata
+	_ "time/tzdata"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
