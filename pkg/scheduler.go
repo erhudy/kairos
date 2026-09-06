@@ -911,58 +911,26 @@ func (s *Scheduler) getWorkload(ref workloadRef) (runtime.Object, error) {
 	}
 }
 
+// reconcileChainEdges brings the chain edges owned by obj (as a follower) in
+// line with its annotations. It reconciles in place: stale edges are pruned and
+// desired ones are added or replaced under each predecessor entry's lock, so an
+// edge that is present both before and after the reconcile is never observably
+// absent during it. That matters because reconcile runs on every informer update
+// for the follower, while triggerFollowers reads the map once at firing time
+// without retrying and runChainStep aborts if it sees the edge missing.
 func (s *Scheduler) reconcileChainEdges(obj runtime.Object) {
 	om, objk := getObjectMetaAndKind(obj)
 	ri := getResourceIdentifier(om, objk)
 
-	// rebuild from scratch so removed/invalid annotations drop stale edges; the
-	// desired set is re-registered below when valid
-	s.removeChainEdgesForFollower(ri)
+	// an empty or invalid desired set drops every edge, so a removed or broken
+	// annotation never leaves stale edges behind
+	refs, mode, wait := s.desiredChainEdges(om, ri)
 
-	if !hasChainAnnotations(om) {
-		return
+	desired := make(map[resourceIdentifier]struct{}, len(refs))
+	for _, ref := range refs {
+		desired[ref.identifier()] = struct{}{}
 	}
-
-	refs, err := parsePredecessorRefs(om)
-	if err != nil {
-		s.logger.Error("invalid restart-after annotation, skipping chain edges", zap.String("resource", string(ri)), zap.Error(err))
-		return
-	}
-
-	modeStr := strings.TrimSpace(om.GetAnnotations()[RESTART_AFTER_MODE_KEY])
-	var mode chainMode
-	switch modeStr {
-	case "", CHAIN_MODE_HEALTH:
-		mode = chainModeHealth
-	case CHAIN_MODE_HEALTH_PLUS_WAIT:
-		mode = chainModeHealthPlusWait
-	default:
-		s.logger.Error("invalid restart-after-mode, skipping chain edges", zap.String("resource", string(ri)), zap.String("mode", modeStr))
-		return
-	}
-
-	waitStr := strings.TrimSpace(om.GetAnnotations()[RESTART_AFTER_WAIT_KEY])
-	var wait time.Duration
-	if waitStr != "" {
-		d, err := time.ParseDuration(waitStr)
-		if err != nil || d <= 0 {
-			s.logger.Error("invalid restart-after-wait, skipping chain edges", zap.String("resource", string(ri)), zap.String("wait", waitStr), zap.Error(err))
-			return
-		}
-		wait = d
-	}
-	switch mode {
-	case chainModeHealth:
-		if waitStr != "" {
-			s.logger.Error("restart-after-wait is only valid with restart-after-mode health-plus-wait, skipping chain edges", zap.String("resource", string(ri)))
-			return
-		}
-	case chainModeHealthPlusWait:
-		if waitStr == "" {
-			s.logger.Error("restart-after-wait is required with restart-after-mode health-plus-wait, skipping chain edges", zap.String("resource", string(ri)))
-			return
-		}
-	}
+	s.removeChainEdgesForFollowerExcept(ri, desired)
 
 	for _, ref := range refs {
 		predRi := ref.identifier()
@@ -971,10 +939,15 @@ func (s *Scheduler) reconcileChainEdges(obj runtime.Object) {
 				zap.String("follower", string(ri)),
 				zap.String("predecessor", string(predRi)),
 			)
+			// an edge that would now close a cycle must not survive from a previous
+			// reconcile either
+			s.removeChainEdge(predRi, ri)
 			continue
 		}
 		entry := s.getOrCreateChainEntry(predRi)
 		entry.Lock()
+		// replace the pointer rather than mutating the existing edge: in-flight
+		// chain steps read edge fields without the lock
 		entry.edges[ri] = &chainEdge{
 			predecessor: ref,
 			followerRi:  ri,
@@ -991,6 +964,58 @@ func (s *Scheduler) reconcileChainEdges(obj runtime.Object) {
 	}
 }
 
+// desiredChainEdges parses and validates the chain annotations on om. It returns
+// the predecessors the follower should have edges from, plus the mode and wait
+// shared by all of them. Any validation failure is logged and yields no refs, so
+// the caller drops every edge the follower currently owns.
+func (s *Scheduler) desiredChainEdges(om metav1.Object, ri resourceIdentifier) ([]workloadRef, chainMode, time.Duration) {
+	if !hasChainAnnotations(om) {
+		return nil, chainModeHealth, 0
+	}
+
+	refs, err := parsePredecessorRefs(om)
+	if err != nil {
+		s.logger.Error("invalid restart-after annotation, skipping chain edges", zap.String("resource", string(ri)), zap.Error(err))
+		return nil, chainModeHealth, 0
+	}
+
+	modeStr := strings.TrimSpace(om.GetAnnotations()[RESTART_AFTER_MODE_KEY])
+	var mode chainMode
+	switch modeStr {
+	case "", CHAIN_MODE_HEALTH:
+		mode = chainModeHealth
+	case CHAIN_MODE_HEALTH_PLUS_WAIT:
+		mode = chainModeHealthPlusWait
+	default:
+		s.logger.Error("invalid restart-after-mode, skipping chain edges", zap.String("resource", string(ri)), zap.String("mode", modeStr))
+		return nil, chainModeHealth, 0
+	}
+
+	waitStr := strings.TrimSpace(om.GetAnnotations()[RESTART_AFTER_WAIT_KEY])
+	var wait time.Duration
+	if waitStr != "" {
+		d, err := time.ParseDuration(waitStr)
+		if err != nil || d <= 0 {
+			s.logger.Error("invalid restart-after-wait, skipping chain edges", zap.String("resource", string(ri)), zap.String("wait", waitStr), zap.Error(err))
+			return nil, chainModeHealth, 0
+		}
+		wait = d
+	}
+	switch mode {
+	case chainModeHealth:
+		if waitStr != "" {
+			s.logger.Error("restart-after-wait is only valid with restart-after-mode health-plus-wait, skipping chain edges", zap.String("resource", string(ri)))
+			return nil, chainModeHealth, 0
+		}
+	case chainModeHealthPlusWait:
+		if waitStr == "" {
+			s.logger.Error("restart-after-wait is required with restart-after-mode health-plus-wait, skipping chain edges", zap.String("resource", string(ri)))
+			return nil, chainModeHealth, 0
+		}
+	}
+	return refs, mode, wait
+}
+
 func (s *Scheduler) getOrCreateChainEntry(predRi resourceIdentifier) *chainMapEntry {
 	raw, ok := s.chainMap.Load(predRi)
 	if ok {
@@ -1001,19 +1026,43 @@ func (s *Scheduler) getOrCreateChainEntry(predRi resourceIdentifier) *chainMapEn
 	return actual.(*chainMapEntry)
 }
 
+// removeChainEdgesForFollower drops every edge the follower owns.
 func (s *Scheduler) removeChainEdgesForFollower(followerRi resourceIdentifier) {
+	s.removeChainEdgesForFollowerExcept(followerRi, nil)
+}
+
+// removeChainEdgesForFollowerExcept drops the follower's edges from every
+// predecessor not in keep, deleting predecessor entries that become empty.
+// Edges from predecessors in keep are left untouched, not removed and re-added.
+func (s *Scheduler) removeChainEdgesForFollowerExcept(followerRi resourceIdentifier, keep map[resourceIdentifier]struct{}) {
 	s.chainMap.Range(func(key, value any) bool {
-		entry := value.(*chainMapEntry)
-		entry.Lock()
-		if _, ok := entry.edges[followerRi]; ok {
-			delete(entry.edges, followerRi)
-			if len(entry.edges) == 0 {
-				s.chainMap.Delete(key)
-			}
+		if _, kept := keep[key.(resourceIdentifier)]; kept {
+			return true
 		}
-		entry.Unlock()
+		s.removeChainEdgeFromEntry(key, value.(*chainMapEntry), followerRi)
 		return true
 	})
+}
+
+// removeChainEdge drops the single predRi→followerRi edge, if present.
+func (s *Scheduler) removeChainEdge(predRi, followerRi resourceIdentifier) {
+	raw, ok := s.chainMap.Load(predRi)
+	if !ok {
+		return
+	}
+	s.removeChainEdgeFromEntry(predRi, raw.(*chainMapEntry), followerRi)
+}
+
+func (s *Scheduler) removeChainEdgeFromEntry(key any, entry *chainMapEntry, followerRi resourceIdentifier) {
+	entry.Lock()
+	defer entry.Unlock()
+	if _, ok := entry.edges[followerRi]; !ok {
+		return
+	}
+	delete(entry.edges, followerRi)
+	if len(entry.edges) == 0 {
+		s.chainMap.Delete(key)
+	}
 }
 
 func (s *Scheduler) edgeStillRegistered(predRi, followerRi resourceIdentifier) bool {

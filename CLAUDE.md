@@ -48,8 +48,10 @@ Kubernetes Informer (per resource type)
         → reconcileJobsForResource(): add/update/remove gocron jobs; every phase runs
           even if an earlier one failed (errors are joined, not returned early), so a
           bad pattern cannot block other patterns, stale-job deletion, or chain edges
-        → reconcileChainEdges(): rebuild this resource's follower edges (validation,
-          cycle detection). An edge is owned by the follower that declared
+        → reconcileChainEdges(): reconcile this resource's follower edges in place (validation,
+          cycle detection): stale edges are pruned and desired ones added or replaced
+          under each entry's lock, so an unchanged edge is never observably absent
+          while its follower is reconciled. An edge is owned by the follower that declared
           restart-after: only the follower's own reconcile/delete drops it. A
           predecessor's delete leaves chainMap[pred] intact (the edges are inert while
           it cannot fire), so churn on the predecessor — losing its cron-pattern, being
