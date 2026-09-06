@@ -36,12 +36,17 @@ jobs:
       - name: Compute release tag
         run: echo "RELEASE_TAG=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')" >> $GITHUB_ENV
 
+      - name: Compute Go version
+        run: echo "GO_VERSION=$(hack/go-version.sh)" >> $GITHUB_ENV
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            GO_VERSION=${{ env.GO_VERSION }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
