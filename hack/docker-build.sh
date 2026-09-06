@@ -7,9 +7,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GO_VERSION="$("$REPO_ROOT/hack/go-version.sh")"
+VERSION="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo dev)"
 
 exec docker build \
   --build-arg "GO_VERSION=${GO_VERSION}" \
+  --build-arg "VERSION=${VERSION}" \
   -t "${IMAGE:-kairos:dev}" \
   "$@" \
   "$REPO_ROOT"

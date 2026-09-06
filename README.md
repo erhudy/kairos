@@ -69,6 +69,7 @@ A follower may name several predecessors, but the semantics are **after whicheve
 | `-resync` | `10m` | Informer resync period; every watched resource is re-reconciled on this interval so rejected chain edges and dropped reconciles recover. `0` disables |
 | `-metrics-addr` | `:9090` | Listen address for the metrics endpoint, JSON API, and web UI |
 | `-debug` | `false` | Development-style logging at debug level |
+| `-version` | | Print the build version and exit |
 
 ## Observability
 

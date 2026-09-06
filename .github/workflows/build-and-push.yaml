@@ -47,6 +47,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             GO_VERSION=${{ env.GO_VERSION }}
+            VERSION=${{ env.RELEASE_TAG }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

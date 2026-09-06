@@ -12,6 +12,9 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS builder
 # platform instead of cross-compiling.
 ARG TARGETOS
 ARG TARGETARCH
+# stamped into the binary as main.version; the release workflow passes the
+# release tag, hack/docker-build.sh passes `git describe`
+ARG VERSION=dev
 
 WORKDIR /build
 
@@ -22,7 +25,7 @@ COPY go.mod /build/
 COPY go.sum /build/
 
 RUN \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /build/kairos . && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-X main.version=${VERSION}" -o /build/kairos . && \
     chmod +x kairos
 
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
