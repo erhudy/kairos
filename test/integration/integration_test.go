@@ -24,7 +24,8 @@ const (
 // applied. Phases run sequentially; each phase manages its own kairos process
 // (different flags per phase). Total runtime is ~20 minutes because cron
 // schedules are minute-granularity and kairos fires on wall-clock boundaries,
-// and PhaseE adds chained-cascade waits on top of that.
+// and PhaseE adds chained-cascade waits (plus predecessor-churn re-registration)
+// on top of that.
 // Host sleep during a boundary window yields SKIPs (not false failures); keep
 // the machine awake for a fully meaningful run.
 func TestIntegration(t *testing.T) {
@@ -548,6 +549,100 @@ func phaseEChainedRestarts(t *testing.T) {
 
 		// ...while the detached tail stays quiet well past when it used to fire (~mid+45s)
 		assertNoRestart(t, g, "Deployment", ns1, tail, tailBaseline, 75*time.Second)
+	})
+
+	// A chain edge is owned by the follower that declared restart-after, so churn on
+	// the *predecessor* must not drop it. Before the fix for #39, deleteJobsForResource
+	// wiped chainMap[head] and nothing ever put it back, silently orphaning mid.
+	t.Run("PredecessorChurnKeepsChain", func(t *testing.T) {
+		removeWorkloadAnnotation(t, "Deployment", ns1, head, cronPatternKey)
+		err := pollUntil(30*time.Second, func() error {
+			entries, err := fetchJobs(p.port)
+			if err != nil {
+				return err
+			}
+			if n := len(jobsFor(entries, ns1, head)); n != 0 {
+				return fmt.Errorf("%d entries still registered for %s/%s", n, ns1, head)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("head not untracked after cron-pattern removal: %v", err)
+		}
+
+		setWorkloadAnnotation(t, "Deployment", ns1, head, map[string]string{cronPatternKey: "* * * * *"})
+		waitForJobsRegistered(t, p.port, [][2]string{{ns1, head}})
+
+		// mid must still be listed as a chained follower of head; a pure follower can
+		// only reach /api/jobs through the chain graph, so this asserts the edge itself
+		err = pollUntil(registrationTimeout, func() error {
+			entries, err := fetchJobs(p.port)
+			if err != nil {
+				return err
+			}
+			for _, e := range jobsFor(entries, ns1, mid) {
+				if e.CronPattern == "" && e.RestartAfter == "deployment/"+head {
+					return nil
+				}
+			}
+			return fmt.Errorf("no chained entry for %s/%s after predecessor churn", ns1, mid)
+		})
+		if err != nil {
+			t.Fatalf("chain edge lost across predecessor churn: %v", err)
+		}
+
+		// and the edge must still actually fire; baselines must be re-read here
+		// because both have restarted many times since the phase started
+		g := newClockGuard(10 * time.Second)
+		headBaseline := getRestartAnnotation(t, "Deployment", ns1, head)
+		midBaseline := getRestartAnnotation(t, "StatefulSet", ns1, mid)
+		boundary := nextMinuteBoundary()
+		waitUntil(boundary.Add(time.Second))
+		g.tick()
+
+		headTs := waitForRestart(t, g, "Deployment", ns1, head, headBaseline, 75*time.Second)
+		midTs := waitForRestart(t, g, "StatefulSet", ns1, mid, midBaseline, 90*time.Second)
+		if midTs.Before(headTs) {
+			t.Errorf("mid restarted at %v before head at %v; cascade must follow the predecessor", midTs, headTs)
+		}
+	})
+
+	// An unparseable cron-pattern is a permanent error. Before the fix for #40 it
+	// aborted the reconcile before reconcileChainEdges, so a valid restart-after on
+	// the same object was never registered and the workqueue then dropped the key.
+	t.Run("InvalidPatternDoesNotBlockChain", func(t *testing.T) {
+		const badcron = "erhudy-test-chain-badcron"
+
+		err := pollUntil(registrationTimeout, func() error {
+			entries, err := fetchJobs(p.port)
+			if err != nil {
+				return err
+			}
+			for _, e := range jobsFor(entries, ns1, badcron) {
+				if e.CronPattern == "" && e.RestartAfter == "deployment/"+head {
+					return nil
+				}
+			}
+			return fmt.Errorf("no chained entry for %s/%s; invalid cron-pattern blocked its restart-after", ns1, badcron)
+		})
+		if err != nil {
+			t.Fatalf("chain edge not registered alongside an invalid cron-pattern: %v", err)
+		}
+
+		// the invalid pattern must still be surfaced as a sync error, not swallowed
+		text, err := fetchMetrics(p.port)
+		if err != nil {
+			t.Fatalf("fetching /metrics: %v", err)
+		}
+		if v, ok := counterValue(text, "kairos_sync_errors_total", map[string]string{"kind": "deployments"}); !ok || v < 1 {
+			t.Errorf("expected kairos_sync_errors_total >= 1 for the invalid pattern, got %v (found=%v)", v, ok)
+		}
+
+		// and the edge must fire: allow several cascades rather than pinning to one
+		// boundary, so a single missed cascade is not a failure
+		baseline := getRestartAnnotation(t, "Deployment", ns1, badcron)
+		g := newClockGuard(10 * time.Second)
+		waitForRestart(t, g, "Deployment", ns1, badcron, baseline, 3*time.Minute)
 	})
 
 	p.stop()

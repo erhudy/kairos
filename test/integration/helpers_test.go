@@ -21,6 +21,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // kairosProc manages one kairos subprocess.
@@ -246,46 +247,55 @@ func getRestartAnnotation(t *testing.T, kind, ns, name string) string {
 	}
 }
 
+// patchWorkloadAnnotations applies a JSON merge patch to a workload's metadata
+// annotations; a nil value removes that key. These fixtures are actively rolling
+// while the tests mutate them, so a read-then-update would lose races against the
+// deployment controller's status writes ("the object has been modified").
+func patchWorkloadAnnotations(t *testing.T, kind, ns, name string, anns map[string]any) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": anns},
+	})
+	if err != nil {
+		t.Fatalf("building annotation patch for %s %s/%s: %v", kind, ns, name, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	opts := metav1.PatchOptions{}
+	switch kind {
+	case "Deployment":
+		_, err = clientset.AppsV1().Deployments(ns).Patch(ctx, name, types.MergePatchType, payload, opts)
+	case "DaemonSet":
+		_, err = clientset.AppsV1().DaemonSets(ns).Patch(ctx, name, types.MergePatchType, payload, opts)
+	case "StatefulSet":
+		_, err = clientset.AppsV1().StatefulSets(ns).Patch(ctx, name, types.MergePatchType, payload, opts)
+	default:
+		t.Fatalf("patchWorkloadAnnotations not implemented for kind %q", kind)
+	}
+	if err != nil {
+		t.Fatalf("patching annotations %v on %s %s/%s: %v", anns, kind, ns, name, err)
+	}
+}
+
 // removeWorkloadAnnotation deletes the given metadata annotations from a workload.
 func removeWorkloadAnnotation(t *testing.T, kind, ns, name string, keys ...string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	anns := map[string]any{}
+	for _, k := range keys {
+		anns[k] = nil
+	}
+	patchWorkloadAnnotations(t, kind, ns, name, anns)
+}
 
-	del := func(anns map[string]string) {
-		for _, k := range keys {
-			delete(anns, k)
-		}
+// setWorkloadAnnotation sets metadata annotations on a workload.
+func setWorkloadAnnotation(t *testing.T, kind, ns, name string, kv map[string]string) {
+	t.Helper()
+	anns := make(map[string]any, len(kv))
+	for k, v := range kv {
+		anns[k] = v
 	}
-	var err error
-	switch kind {
-	case "Deployment":
-		obj, gerr := clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-		if gerr != nil {
-			t.Fatalf("getting Deployment %s/%s: %v", ns, name, gerr)
-		}
-		del(obj.Annotations)
-		_, err = clientset.AppsV1().Deployments(ns).Update(ctx, obj, metav1.UpdateOptions{})
-	case "DaemonSet":
-		obj, gerr := clientset.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
-		if gerr != nil {
-			t.Fatalf("getting DaemonSet %s/%s: %v", ns, name, gerr)
-		}
-		del(obj.Annotations)
-		_, err = clientset.AppsV1().DaemonSets(ns).Update(ctx, obj, metav1.UpdateOptions{})
-	case "StatefulSet":
-		obj, gerr := clientset.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
-		if gerr != nil {
-			t.Fatalf("getting StatefulSet %s/%s: %v", ns, name, gerr)
-		}
-		del(obj.Annotations)
-		_, err = clientset.AppsV1().StatefulSets(ns).Update(ctx, obj, metav1.UpdateOptions{})
-	default:
-		t.Fatalf("removeWorkloadAnnotation not implemented for kind %q", kind)
-	}
-	if err != nil {
-		t.Fatalf("removing annotations %v from %s %s/%s: %v", keys, kind, ns, name, err)
-	}
+	patchWorkloadAnnotations(t, kind, ns, name, anns)
 }
 
 func deleteWorkload(t *testing.T, kind, ns, name string) {
