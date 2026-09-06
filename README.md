@@ -119,3 +119,7 @@ hack/run-integration.sh         # end-to-end suite against a local kind cluster 
 ## Todos
 
 * de-duplicate various code paths through unhealthy `reflect` witchcraft
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
