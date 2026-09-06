@@ -1,6 +1,6 @@
 module github.com/erhudy/kairos
 
-go 1.26.2
+go 1.27.1
 
 require (
 	github.com/go-co-op/gocron v1.37.0

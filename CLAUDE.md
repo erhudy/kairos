@@ -22,7 +22,16 @@ golangci-lint run
 
 # Run locally against a cluster (kubeconfig required)
 go run main.go -kubeconfig ~/.kube/config
+
+# Build the container image (passes the Go version from go.mod as a build arg)
+hack/docker-build.sh
 ```
+
+The Go toolchain version lives in exactly one place: the `go` directive in
+`go.mod`. `hack/go-version.sh` reads it; `hack/docker-build.sh` and the release
+workflow pass it to the Dockerfile as `GO_VERSION` (which has no default on
+purpose), and the test workflow uses `go-version-file: go.mod`. Bump `go.mod`
+and everything follows.
 
 Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-chain-timeout` (how long a chained restart waits for its predecessor to become healthy again before aborting the cascade; default 10m), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
 
