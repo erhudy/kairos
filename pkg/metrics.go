@@ -31,7 +31,7 @@ func NewKairosMetrics() *KairosMetrics {
 		}, []string{"kind", "namespace", "name", "error_phase"}),
 		RestartDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "kairos_restart_duration_seconds",
-			Help:    "Duration of restart operations (Get + Update) in seconds",
+			Help:    "Duration of successful restart patches in seconds",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"kind", "namespace", "name"}),
 		ScheduledJobs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
