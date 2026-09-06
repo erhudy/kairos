@@ -1,3 +1,4 @@
 .vscode
 kairos
-/bin/.claude/settings.local.json
+/bin/
+.claude/settings.local.json
