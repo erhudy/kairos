@@ -1,0 +1,17 @@
+---
+# exposes the Prometheus /metrics endpoint and the job-status web UI served on
+# -metrics-addr (default :9090)
+apiVersion: v1
+kind: Service
+metadata:
+  name: kairos
+  labels:
+    app.kubernetes.io/name: kairos
+spec:
+  selector:
+    app.kubernetes.io/name: kairos
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      protocol: TCP

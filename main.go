@@ -28,6 +28,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	// -timezone and TZ=-prefixed patterns need zoneinfo at runtime; embedding it
+	// keeps them working if the base image ever stops shipping tzdata
+	_ "time/tzdata"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -48,6 +51,7 @@ func main() {
 	var maxJitter time.Duration
 	var lookback time.Duration
 	var chainTimeout time.Duration
+	var resync time.Duration
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
@@ -58,6 +62,7 @@ func main() {
 	flag.DurationVar(&maxJitter, "jitter", 0, "maximum random jitter to add before each restart (e.g. 15m); 0 disables jitter")
 	flag.DurationVar(&lookback, "lookback", 0, "how far back to check for missed restarts on startup (e.g. 30m); 0 disables")
 	flag.DurationVar(&chainTimeout, "chain-timeout", 10*time.Minute, "how long a chained restart waits for its predecessor to become healthy before aborting the cascade (e.g. 30m)")
+	flag.DurationVar(&resync, "resync", 10*time.Minute, "how often every watched resource is re-reconciled even without a change, so rejected chain edges and dropped reconciles recover (e.g. 10m); 0 disables")
 	flag.Parse()
 
 	var logger *zap.Logger
@@ -95,11 +100,14 @@ func main() {
 	metrics := pkg.NewKairosMetrics()
 	metrics.Register(registry)
 
-	deploymentController := pkg.GenerateDeploymentController(logger, clientset, namespace, workchan, metrics)
-	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
-	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
+	deploymentController := pkg.GenerateDeploymentController(logger, clientset, namespace, resync, workchan, metrics)
+	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, resync, workchan, metrics)
+	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, resync, workchan, metrics)
 
-	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback, chainTimeout)
+	scheduler, err := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback, chainTimeout)
+	if err != nil {
+		logger.Fatal("unable to create scheduler", zap.Error(err))
+	}
 
 	// listen synchronously so a bind failure fails fast before other components start;
 	// logger.Fatal here is safe because it runs on the main goroutine

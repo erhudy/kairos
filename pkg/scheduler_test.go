@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-co-op/gocron"
+	"github.com/go-co-op/gocron/v2"
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
@@ -35,9 +36,35 @@ func newTestSchedulerWithLookback(t *testing.T, lookback time.Duration, objects 
 	tz, err := time.LoadLocation("")
 	require.NoError(t, err)
 	ch := make(chan ObjectAndSchedulerAction, 10)
-	s := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback, 10*time.Minute)
+	s, err := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback, 10*time.Minute)
+	require.NoError(t, err)
 	return s, clientset
 }
+
+// shutdownCron stops the scheduler's gocron instance the way Scheduler.Run does:
+// wake any jitter/chain sleeps first so Shutdown does not wait out its stop
+// timeout on them.
+func shutdownCron(s *Scheduler) {
+	s.shutdownCancel()
+	_ = s.cron.Shutdown()
+}
+
+// runAllJobs force-fires every registered gocron job immediately (the v1
+// RunAll equivalent). RunNow returns once the job is dispatched, not completed.
+func runAllJobs(t *testing.T, s *Scheduler) {
+	t.Helper()
+	for _, j := range s.cron.Jobs() {
+		require.NoError(t, j.RunNow())
+	}
+}
+
+// stubJob is a gocron.Job whose only usable method is ID; the zero UUID is
+// never registered, so RemoveJob on it reports ErrJobNotFound.
+type stubJob struct {
+	gocron.Job
+}
+
+func (stubJob) ID() uuid.UUID { return uuid.Nil }
 
 // newTestSchedulerWithChain creates a Scheduler with chain support tuned for
 // fast unit tests: short timeout and health-poll interval.
@@ -204,8 +231,8 @@ func TestReconcileJobsForResource(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
 			s, _ := newTestScheduler(t, tt.object)
-			s.cron.StartAsync()
-			defer s.cron.Stop()
+			s.cron.Start()
+			defer shutdownCron(s)
 
 			err := s.reconcileJobsForResource(tt.object)
 			if tt.expectErr {
@@ -234,6 +261,37 @@ func TestReconcileJobsForResource(t *testing.T) {
 	}
 }
 
+func TestReconcileJobsDedupesRepeatedPatterns(t *testing.T) {
+	t.Parallel()
+
+	dep := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dep-dupe",
+			Namespace: "ns1",
+			Annotations: map[string]string{
+				// the same pattern twice, once with surrounding whitespace, plus one distinct one
+				CRON_PATTERN_KEY: "0 0 * * *; 0 0 * * * ;30 6 * * *",
+			},
+		},
+	}
+	s, _ := newTestScheduler(t, dep)
+	s.cron.Start()
+	defer shutdownCron(s)
+
+	// a repeated pattern must not surface as a reconcile error, and must
+	// register exactly one job in both kairos's map and the underlying scheduler
+	require.NoError(t, s.reconcileJobsForResource(dep))
+
+	om, ok := getObjectMetaAndKind(dep)
+	ri := getResourceIdentifier(om, ok)
+	raw, loaded := s.resourceMap.Load(ri)
+	require.True(t, loaded)
+	m := raw.(*resourceMapEntry)
+	require.Len(t, m.jobs, 2)
+	require.Len(t, s.cron.Jobs(), 2, "duplicate pattern must not leak an extra job into the cron scheduler")
+}
+
 func TestReconcileJobsPatternChange(t *testing.T) {
 	t.Parallel()
 
@@ -248,8 +306,8 @@ func TestReconcileJobsPatternChange(t *testing.T) {
 		},
 	}
 	s, _ := newTestScheduler(t, dep)
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	// First reconcile: adds two patterns
 	err := s.reconcileJobsForResource(dep)
@@ -293,8 +351,8 @@ func TestReconcileJobsContinuesPastBadPattern(t *testing.T) {
 			RESTART_AFTER_KEY: "deployment/bad-head",
 		})
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 
@@ -314,8 +372,8 @@ func TestReconcileJobsContinuesPastBadPattern(t *testing.T) {
 			},
 		}
 		s, _ := newTestScheduler(t, dep)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(dep))
 		ri := riOf(dep)
@@ -347,8 +405,8 @@ func TestReconcileJobsContinuesPastBadPattern(t *testing.T) {
 			},
 		}
 		s, _ := newTestScheduler(t, dep)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		err := s.reconcileJobsForResource(dep)
 		require.Error(t, err)
@@ -398,8 +456,8 @@ func TestReconcileJobsAnnotationRemoved(t *testing.T) {
 				},
 			}
 			s, _ := newTestScheduler(t, dep)
-			s.cron.StartAsync()
-			defer s.cron.Stop()
+			s.cron.Start()
+			defer shutdownCron(s)
 
 			err := s.reconcileJobsForResource(dep)
 			require.NoError(t, err)
@@ -485,8 +543,8 @@ func TestCreateJob(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
 			s, _ := newTestScheduler(t, dep)
-			s.cron.StartAsync()
-			defer s.cron.Stop()
+			s.cron.Start()
+			defer shutdownCron(s)
 
 			om, ok := getObjectMetaAndKind(dep)
 			ri := getResourceIdentifier(om, ok)
@@ -524,8 +582,8 @@ func TestDeleteJobsForResource(t *testing.T) {
 
 	t.Run("delete all jobs for resource", func(t *testing.T) {
 		s, _ := newTestScheduler(t, dep)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		// First add jobs via reconcile
 		err := s.reconcileJobsForResource(dep)
@@ -550,8 +608,8 @@ func TestDeleteJobsForResource(t *testing.T) {
 
 	t.Run("delete for nonexistent resource is a no-op", func(t *testing.T) {
 		s, _ := newTestScheduler(t)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		err := s.deleteJobsForResource(dep)
 		require.NoError(t, err)
@@ -562,9 +620,10 @@ func TestDeleteJobsForResource(t *testing.T) {
 		tz, err := time.LoadLocation("")
 		require.NoError(t, err)
 		metrics := NewKairosMetrics()
-		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0, 10*time.Minute)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s, err := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0, 10*time.Minute)
+		require.NoError(t, err)
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		om, ok := getObjectMetaAndKind(dep)
 		ri := getResourceIdentifier(om, ok)
@@ -573,13 +632,13 @@ func TestDeleteJobsForResource(t *testing.T) {
 		cp := cronPattern("0 0 * * *")
 		entry := &resourceMapEntry{
 			obj:         dep,
-			jobs:        map[cronPattern]*gocron.Job{cp: {}},
+			jobs:        map[cronPattern]gocron.Job{cp: stubJob{}},
 			lastJitters: map[cronPattern]time.Duration{cp: time.Second},
 		}
 		s.resourceMap.Store(ri, entry)
 		metrics.ScheduledJobs.WithLabelValues("Deployment").Inc()
 
-		err = s.deleteJob(cp, ri, &gocron.Job{}, dep)
+		err = s.deleteJob(cp, ri, stubJob{}, dep)
 		require.NoError(t, err)
 
 		entry.RLock()
@@ -612,8 +671,8 @@ func TestProcessSchedulerBundle(t *testing.T) {
 
 	t.Run("RESOURCE_CHANGE dispatches to reconcile", func(t *testing.T) {
 		s, _ := newTestScheduler(t, dep)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: dep})
 
@@ -627,8 +686,8 @@ func TestProcessSchedulerBundle(t *testing.T) {
 
 	t.Run("RESOURCE_DELETE dispatches to delete", func(t *testing.T) {
 		s, _ := newTestScheduler(t, dep)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		// First add, then delete
 		s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: dep})
@@ -848,9 +907,10 @@ func TestCheckMissedRestart(t *testing.T) {
 		clientset := fake.NewClientset(dep)
 		tz, err := time.LoadLocation("")
 		require.NoError(t, err)
-		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute, 10*time.Minute)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s, err := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute, 10*time.Minute)
+		require.NoError(t, err)
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		om, kind := getObjectMetaAndKind(dep)
 		ri := getResourceIdentifier(om, kind)
@@ -1056,8 +1116,8 @@ func TestSchedulerEndToEnd(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
 			s, clientset := newTestScheduler(t, tt.object)
-			s.cron.StartAsync()
-			defer s.cron.Stop()
+			s.cron.Start()
+			defer shutdownCron(s)
 
 			startTime := time.Now().Truncate(time.Second)
 
@@ -1065,7 +1125,7 @@ func TestSchedulerEndToEnd(t *testing.T) {
 			s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: tt.object})
 
 			// Force-fire all scheduled jobs immediately
-			s.cron.RunAll()
+			runAllJobs(t, s)
 
 			// Poll until the restart annotation appears rather than using a fixed sleep
 			var obj runtime.Object
@@ -1199,8 +1259,8 @@ func TestReconcileChainEdges(t *testing.T) {
 	t.Run("registers edge for pure follower", func(t *testing.T) {
 		head, mid := newHeadMid()
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1219,8 +1279,8 @@ func TestReconcileChainEdges(t *testing.T) {
 	t.Run("stale edge removed when annotation removed", func(t *testing.T) {
 		head, mid := newHeadMid()
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1237,8 +1297,8 @@ func TestReconcileChainEdges(t *testing.T) {
 	t.Run("follower delete removes its edges, predecessor delete does not", func(t *testing.T) {
 		head, mid := newHeadMid()
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1362,8 +1422,8 @@ func TestChainEdgeSurvivesPredecessorChurn(t *testing.T) {
 		head := healthyDeployment("churn-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
 		mid := healthyStatefulSet("churn-mid", map[string]string{RESTART_AFTER_KEY: "deployment/churn-head"})
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1386,8 +1446,8 @@ func TestChainEdgeSurvivesPredecessorChurn(t *testing.T) {
 		head := healthyDeployment("recreate-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
 		mid := healthyStatefulSet("recreate-mid", map[string]string{RESTART_AFTER_KEY: "deployment/recreate-head"})
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1406,8 +1466,8 @@ func TestChainEdgeSurvivesPredecessorChurn(t *testing.T) {
 		mid := healthyStatefulSet("bare-mid", map[string]string{RESTART_AFTER_KEY: "deployment/bare-head"})
 		bare := healthyDeployment("bare-head", nil)
 		s, _ := newTestSchedulerWithChain(t, time.Minute, bare, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(mid))
 		require.NotNil(t, edgeFor(s, riOf(bare), riOf(mid)))
@@ -1421,8 +1481,8 @@ func TestChainEdgeSurvivesPredecessorChurn(t *testing.T) {
 		head := healthyDeployment("fire-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
 		mid := healthyStatefulSet("fire-mid", map[string]string{RESTART_AFTER_KEY: "deployment/fire-head"})
 		s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1499,8 +1559,8 @@ func TestReconcileChainEdgeValidation(t *testing.T) {
 			follower := healthyDeployment("follower", tt.anns)
 
 			s, _ := newTestSchedulerWithChain(t, time.Minute, head, follower)
-			s.cron.StartAsync()
-			defer s.cron.Stop()
+			s.cron.Start()
+			defer shutdownCron(s)
 
 			require.NoError(t, s.reconcileJobsForResource(head))
 			require.NoError(t, s.reconcileJobsForResource(follower))
@@ -1526,8 +1586,8 @@ func TestChainCycleDetection(t *testing.T) {
 			RESTART_AFTER_KEY: "deployment/loop",
 		})
 		s, _ := newTestSchedulerWithChain(t, time.Minute, dep)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(dep))
 		require.Nil(t, edgeFor(s, riOf(dep), riOf(dep)))
@@ -1537,8 +1597,8 @@ func TestChainCycleDetection(t *testing.T) {
 		a := healthyDeployment("a", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
 		b := healthyStatefulSet("b", map[string]string{RESTART_AFTER_KEY: "deployment/a"})
 		s, _ := newTestSchedulerWithChain(t, time.Minute, a, b)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(a))
 		require.NoError(t, s.reconcileJobsForResource(b))
@@ -1556,8 +1616,8 @@ func TestChainCycleDetection(t *testing.T) {
 		c := healthyDeployment("d-c", map[string]string{RESTART_AFTER_KEY: "deployment/d-a"})
 		d := healthyDeployment("d-d", map[string]string{RESTART_AFTER_KEY: "statefulset/d-b,deployment/d-c"})
 		s, _ := newTestSchedulerWithChain(t, time.Minute, a, b, c, d)
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		for _, obj := range []runtime.Object{a, b, c, d} {
 			require.NoError(t, s.reconcileJobsForResource(obj))
@@ -1565,6 +1625,39 @@ func TestChainCycleDetection(t *testing.T) {
 		require.NotNil(t, edgeFor(s, riOf(b), riOf(d)))
 		require.NotNil(t, edgeFor(s, riOf(c), riOf(d)))
 	})
+}
+
+// A cycle-rejected edge is only ever re-evaluated by its follower's own
+// reconcile. This pins the property the informer resync relies on: once the
+// cycle is broken elsewhere, simply reconciling the follower again (as a resync
+// does, with no change to the object) registers the previously rejected edge.
+func TestChainCycleRejectionRecoversOnReconcile(t *testing.T) {
+	t.Parallel()
+
+	a := healthyDeployment("rc-a", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	b := healthyStatefulSet("rc-b", map[string]string{RESTART_AFTER_KEY: "deployment/rc-a"})
+	s, _ := newTestSchedulerWithChain(t, time.Minute, a, b)
+	s.cron.Start()
+	defer shutdownCron(s)
+
+	require.NoError(t, s.reconcileJobsForResource(a))
+	require.NoError(t, s.reconcileJobsForResource(b))
+	require.NotNil(t, edgeFor(s, riOf(a), riOf(b)))
+
+	// a now wants to follow b: a->b->a is a cycle, so b->a is rejected
+	a.Annotations[RESTART_AFTER_KEY] = "statefulset/rc-b"
+	require.NoError(t, s.reconcileJobsForResource(a))
+	require.Nil(t, edgeFor(s, riOf(b), riOf(a)))
+
+	// b stops following a; that breaks the cycle but nothing touches a
+	delete(b.Annotations, RESTART_AFTER_KEY)
+	require.NoError(t, s.reconcileJobsForResource(b))
+	require.Nil(t, edgeFor(s, riOf(a), riOf(b)))
+	require.Nil(t, edgeFor(s, riOf(b), riOf(a)), "a's edge is still absent until a is reconciled again")
+
+	// a resync re-reconciles a with the very same object; the edge must appear
+	require.NoError(t, s.reconcileJobsForResource(a))
+	require.NotNil(t, edgeFor(s, riOf(b), riOf(a)), "re-reconcile must register the edge once the cycle is gone")
 }
 
 func TestIsRolloutComplete(t *testing.T) {
@@ -1726,14 +1819,14 @@ func TestChainHealthEndToEnd(t *testing.T) {
 	s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid, tail)
 	metrics := NewKairosMetrics()
 	s.metrics = metrics
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	for _, obj := range []runtime.Object{head, mid, tail} {
 		s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj})
 	}
 
-	s.cron.RunAll()
+	runAllJobs(t, s)
 
 	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "e2e-head") }, 5*time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool { return hasRestarted(clientset, "StatefulSet", "e2e-mid") }, 5*time.Second, 10*time.Millisecond, "expected mid to restart after head")
@@ -1750,12 +1843,12 @@ func TestChainWaitsForPredecessorHealth(t *testing.T) {
 	mid := healthyStatefulSet("gate-mid", map[string]string{RESTART_AFTER_KEY: "deployment/gate-head"})
 
 	s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: head})
 	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: mid})
-	s.cron.RunAll()
+	runAllJobs(t, s)
 
 	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "gate-head") }, 5*time.Second, 10*time.Millisecond)
 
@@ -1779,12 +1872,12 @@ func TestChainHealthPlusWaitTiming(t *testing.T) {
 	})
 
 	s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: head})
 	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: follower})
-	s.cron.RunAll()
+	runAllJobs(t, s)
 
 	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "wait-head") }, 5*time.Second, 5*time.Millisecond)
 	headAt := time.Now()
@@ -1805,13 +1898,13 @@ func TestChainTimeoutAbortsCascade(t *testing.T) {
 	s, clientset := newTestSchedulerWithChain(t, 300*time.Millisecond, head, mid, blocked)
 	metrics := NewKairosMetrics()
 	s.metrics = metrics
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	for _, obj := range []runtime.Object{head, mid, blocked} {
 		s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj})
 	}
-	s.cron.RunAll()
+	runAllJobs(t, s)
 
 	require.Eventually(t, func() bool {
 		return testutil.ToFloat64(metrics.ChainStepsTotal.WithLabelValues("StatefulSet", "ns1", "to-mid", CHAIN_OUTCOME_TIMEOUT)) == 1
@@ -1830,8 +1923,8 @@ func TestPendingStepDedupe(t *testing.T) {
 	mid := healthyStatefulSet("dedupe-mid", map[string]string{RESTART_AFTER_KEY: "deployment/dedupe-head"})
 
 	s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	require.NoError(t, s.reconcileJobsForResource(head))
 	require.NoError(t, s.reconcileJobsForResource(mid))
@@ -1870,8 +1963,8 @@ func TestJobStatusJSONChainedEntries(t *testing.T) {
 	})
 
 	s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid, tail)
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	for _, obj := range []runtime.Object{head, mid, tail} {
 		require.NoError(t, s.reconcileJobsForResource(obj))
@@ -1927,8 +2020,8 @@ func TestChainSettleWaitAbortIsObserved(t *testing.T) {
 		s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
 		metrics := NewKairosMetrics()
 		s.metrics = metrics
-		s.cron.StartAsync()
-		t.Cleanup(s.cron.Stop)
+		s.cron.Start()
+		t.Cleanup(func() { shutdownCron(s) })
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(follower))
@@ -1985,8 +2078,8 @@ func TestChainSettleWaitAbortIsObserved(t *testing.T) {
 		s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
 		metrics := NewKairosMetrics()
 		s.metrics = metrics
-		s.cron.StartAsync()
-		defer s.cron.Stop()
+		s.cron.Start()
+		defer shutdownCron(s)
 
 		require.NoError(t, s.reconcileJobsForResource(head))
 		require.NoError(t, s.reconcileJobsForResource(follower))
@@ -2010,8 +2103,8 @@ func TestDeleteJobGaugeNotLeakedWhenEntryMissing(t *testing.T) {
 	s, _ := newTestScheduler(t, dep)
 	metrics := NewKairosMetrics()
 	s.metrics = metrics
-	s.cron.StartAsync()
-	defer s.cron.Stop()
+	s.cron.Start()
+	defer shutdownCron(s)
 
 	require.NoError(t, s.reconcileJobsForResource(dep))
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.ScheduledJobs.WithLabelValues("Deployment")))
