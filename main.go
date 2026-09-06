@@ -99,7 +99,10 @@ func main() {
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
 
-	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback, chainTimeout)
+	scheduler, err := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback, chainTimeout)
+	if err != nil {
+		logger.Fatal("unable to create scheduler", zap.Error(err))
+	}
 
 	// listen synchronously so a bind failure fails fast before other components start;
 	// logger.Fatal here is safe because it runs on the main goroutine

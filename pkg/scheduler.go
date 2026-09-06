@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-co-op/gocron"
+	"github.com/go-co-op/gocron/v2"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
@@ -24,9 +24,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface, metrics *KairosMetrics, maxJitter time.Duration, lookback time.Duration, chainTimeout time.Duration) *Scheduler {
-	scheduler := gocron.NewScheduler(timezone)
-	scheduler.TagsUnique()
+func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface, metrics *KairosMetrics, maxJitter time.Duration, lookback time.Duration, chainTimeout time.Duration) (*Scheduler, error) {
+	scheduler, err := gocron.NewScheduler(gocron.WithLocation(timezone))
+	if err != nil {
+		return nil, fmt.Errorf("error creating cron scheduler: %w", err)
+	}
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
@@ -47,19 +49,21 @@ func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan O
 		startTime:         time.Now(),
 		shutdownCtx:       shutdownCtx,
 		shutdownCancel:    shutdownCancel,
-	}
+	}, nil
 }
 
 func (s *Scheduler) Run(stopCh chan struct{}) {
-	s.cron.StartAsync()
+	s.cron.Start()
 
 	for {
 		select {
 		case <-stopCh:
 			s.logger.Info("stopping scheduler")
-			// wake any goroutines sleeping in a jitter delay so Stop does not block on them
+			// wake any goroutines sleeping in a jitter delay so Shutdown does not block on them
 			s.shutdownCancel()
-			s.cron.Stop()
+			if err := s.cron.Shutdown(); err != nil {
+				s.logger.Error("error shutting down cron scheduler", zap.Error(err))
+			}
 			return
 		case i := <-s.workchan:
 			s.processSchedulerBundle(i)
@@ -141,11 +145,17 @@ func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
 			if j, ok := entry.lastJitters[cp]; ok && j > 0 {
 				lastJitterStr = j.Round(time.Millisecond).String()
 			}
+			// NextRun errors only if gocron no longer knows the job (e.g. it was
+			// removed between the map read and here); leave the field empty then
+			nextRunStr := ""
+			if next, err := job.NextRun(); err == nil && !next.IsZero() {
+				nextRunStr = next.UTC().Format(time.RFC3339)
+			}
 			entries = append(entries, jobStatusEntry{
 				Resource:         string(ri),
 				CronPattern:      string(cp),
 				LastRun:          lastRunStr,
-				NextRun:          job.NextRun().UTC().Format(time.RFC3339),
+				NextRun:          nextRunStr,
 				LastJitter:       lastJitterStr,
 				RestartAfter:     after,
 				RestartAfterMode: mode,
@@ -373,7 +383,7 @@ func (s *Scheduler) getOrCreateEntry(ri resourceIdentifier, obj runtime.Object) 
 	if !ok {
 		entry := &resourceMapEntry{
 			obj:         obj,
-			jobs:        make(map[cronPattern]*gocron.Job),
+			jobs:        make(map[cronPattern]gocron.Job),
 			lastJitters: make(map[cronPattern]time.Duration),
 		}
 		s.resourceMap.Store(ri, entry)
@@ -389,10 +399,8 @@ func (s *Scheduler) getOrCreateEntry(ri resourceIdentifier, obj runtime.Object) 
 func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime.Object) error {
 	cpString := string(cp)
 
-	var job *gocron.Job
-
 	// if 5 fields, regular cron, if 6 fields, cron with seconds, otherwise freak out
-	var cronFunc func(string) *gocron.Scheduler
+	var withSeconds bool
 
 	s.logger.Debug("working on cp", zap.String("cp", cp.String()))
 
@@ -408,16 +416,14 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 	l := len(strings.Fields(cpString))
 	switch l {
 	case expectedCountForCron:
-		cronFunc = s.cron.Cron
+		withSeconds = false
 	case expectedCountForCronWithSeconds:
-		cronFunc = s.cron.CronWithSeconds
+		withSeconds = true
 	default:
 		return fmt.Errorf("got %d fields in cron expression '%s', expected %d or %d", l, cp, expectedCountForCron, expectedCountForCronWithSeconds)
 	}
 
 	tag := fmt.Sprintf("%s--%s", ri, cp)
-
-	var err error
 
 	// parsed once here so each firing can clamp jitter against its actual next interval
 	schedule, _, err := parseCronExpression(cp, s.timezone)
@@ -426,20 +432,25 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 		schedule = nil
 	}
 
-	scheduler := cronFunc(cpString)
-	job, err = scheduler.Tag(string(tag)).Do(func() {
-		if s.maxJitter > 0 {
-			if !s.sleepWithJitter(cp, ri, schedule) {
-				return
+	// gocron evaluates the expression in the scheduler's location unless the
+	// pattern carries its own TZ=/CRON_TZ= prefix, matching parseCronExpression
+	job, err := s.cron.NewJob(
+		gocron.CronJob(cpString, withSeconds),
+		gocron.NewTask(func() {
+			if s.maxJitter > 0 {
+				if !s.sleepWithJitter(cp, ri, schedule) {
+					return
+				}
+				// the job may have been deleted while we slept; do not restart if so
+				if !s.jobStillRegistered(cp, ri) {
+					s.logger.Info("job removed during jitter sleep, skipping restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cp)))
+					return
+				}
 			}
-			// the job may have been deleted while we slept; do not restart if so
-			if !s.jobStillRegistered(cp, ri) {
-				s.logger.Info("job removed during jitter sleep, skipping restart", zap.String("resource", string(ri)), zap.String("cron-pattern", string(cp)))
-				return
-			}
-		}
-		s.fireRestart(obj)
-	})
+			s.fireRestart(obj)
+		}),
+		gocron.WithTags(tag),
+	)
 	if err != nil {
 		return fmt.Errorf("error in createJob during creation: %w", err)
 	}
@@ -528,7 +539,7 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	s.logger.Info("deleting jobs for resource", zap.String("resource", string(ri)))
 
 	entry.RLock()
-	jobsToDelete := make(map[cronPattern]*gocron.Job)
+	jobsToDelete := make(map[cronPattern]gocron.Job)
 	for cp, job := range entry.jobs {
 		jobsToDelete[cp] = job
 	}
@@ -552,9 +563,9 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	return errors.Join(errs...)
 }
 
-func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron.Job, obj runtime.Object) error {
+func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job gocron.Job, obj runtime.Object) error {
 	notFound := false
-	err := s.cron.RemoveByID(job)
+	err := s.cron.RemoveJob(job.ID())
 	if err != nil && !errors.Is(err, gocron.ErrJobNotFound) {
 		return fmt.Errorf("error in deleteJob: %w", err)
 	} else if err != nil {

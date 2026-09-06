@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-co-op/gocron"
+	"github.com/go-co-op/gocron/v2"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -49,7 +49,7 @@ func (c cronPatterns) String() string {
 type resourceMapEntry struct {
 	sync.RWMutex
 	obj         runtime.Object
-	jobs        map[cronPattern]*gocron.Job
+	jobs        map[cronPattern]gocron.Job
 	lastJitters map[cronPattern]time.Duration
 }
 
@@ -93,7 +93,7 @@ type chainMapEntry struct {
 type Scheduler struct {
 	logger      *zap.Logger
 	workchan    <-chan ObjectAndSchedulerAction
-	cron        *gocron.Scheduler
+	cron        gocron.Scheduler
 	clientset   kubernetes.Interface
 	resourceMap *sync.Map
 	metrics     *KairosMetrics
