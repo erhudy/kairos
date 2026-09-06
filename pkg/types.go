@@ -2,6 +2,7 @@ package pkg
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,41 @@ type resourceMapEntry struct {
 
 type resourceIdentifier string
 
+// workloadRef identifies a workload by canonical kind, namespace, and name.
+type workloadRef struct {
+	kind      string
+	namespace string
+	name      string
+	display   string
+}
+
+func (w workloadRef) identifier() resourceIdentifier {
+	return resourceIdentifier(fmt.Sprintf("apps/v1, Kind=%s/%s/%s", w.kind, w.namespace, w.name))
+}
+
+type chainMode int
+
+const (
+	chainModeHealth chainMode = iota
+	chainModeHealthPlusWait
+)
+
+// chainEdge is a single predecessor→follower link: when the predecessor's restart
+// completes, the follower is restarted once the predecessor is healthy again.
+type chainEdge struct {
+	predecessor workloadRef
+	followerRi  resourceIdentifier
+	obj         runtime.Object
+	mode        chainMode
+	wait        time.Duration
+}
+
+// chainMapEntry holds all followers of one predecessor, guarded by its own mutex.
+type chainMapEntry struct {
+	sync.RWMutex
+	edges map[resourceIdentifier]*chainEdge
+}
+
 type Scheduler struct {
 	logger      *zap.Logger
 	workchan    <-chan ObjectAndSchedulerAction
@@ -64,6 +100,18 @@ type Scheduler struct {
 	maxJitter   time.Duration
 	lookback    time.Duration
 	timezone    *time.Location
+	// chainTimeout caps how long a chain step waits for its predecessor to become
+	// healthy again; when exceeded the cascade is aborted, not fired onto an
+	// unhealthy dependency
+	chainTimeout time.Duration
+	// chainPollInterval is how often a chain step re-checks predecessor health;
+	// a field (not just CHAIN_POLL_INTERVAL) so tests can shrink it
+	chainPollInterval time.Duration
+	// chainMap maps predecessor resourceIdentifier -> *chainMapEntry of followers
+	chainMap *sync.Map
+	// pendingSteps dedupes to one in-flight chain step per follower, keyed by
+	// follower resourceIdentifier
+	pendingSteps *sync.Map
 	// startTime is when this scheduler instance came up; missed-restart catch-up
 	// only applies to firings from before then (i.e. while kairos was not running)
 	startTime      time.Time

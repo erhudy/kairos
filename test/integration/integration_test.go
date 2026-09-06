@@ -17,12 +17,14 @@ const (
 	portNamespace = 19091
 	portJitter    = 19092
 	portLookback  = 19093
+	portChain     = 19094
 )
 
 // TestIntegration runs the full suite against a kind cluster with test.yaml
 // applied. Phases run sequentially; each phase manages its own kairos process
-// (different flags per phase). Total runtime is ~15 minutes because cron
-// schedules are minute-granularity and kairos fires on wall-clock boundaries.
+// (different flags per phase). Total runtime is ~20 minutes because cron
+// schedules are minute-granularity and kairos fires on wall-clock boundaries,
+// and PhaseE adds chained-cascade waits on top of that.
 // Host sleep during a boundary window yields SKIPs (not false failures); keep
 // the machine awake for a fully meaningful run.
 func TestIntegration(t *testing.T) {
@@ -30,6 +32,7 @@ func TestIntegration(t *testing.T) {
 	t.Run("PhaseB_NamespaceScoping", phaseBNamespaceScoping)
 	t.Run("PhaseC_Jitter", phaseCJitter)
 	t.Run("PhaseD_Lookback", phaseDLookback)
+	t.Run("PhaseE_ChainedRestarts", phaseEChainedRestarts)
 }
 
 var allAnnotated = [][2]string{
@@ -59,6 +62,9 @@ func phaseADefault(t *testing.T) {
 		}
 		if cfg.Jitter != "disabled" || cfg.Lookback != "disabled" {
 			t.Errorf("expected jitter/lookback disabled, got %+v", cfg)
+		}
+		if cfg.ChainTimeout != "10m0s" {
+			t.Errorf("expected chain timeout 10m0s by default, got %q", cfg.ChainTimeout)
 		}
 
 		entries := waitForJobsRegistered(t, p.port, allAnnotated)
@@ -194,7 +200,7 @@ func phaseADefault(t *testing.T) {
 		const name = "erhudy-test-every-minute"
 		baseline := getRestartAnnotation(t, "Deployment", ns1, name)
 
-		removeCronAnnotation(t, "Deployment", ns1, name)
+		removeWorkloadAnnotation(t, "Deployment", ns1, name, cronPatternKey)
 
 		err := pollUntil(20*time.Second, func() error {
 			entries, err := fetchJobs(p.port)
@@ -347,6 +353,202 @@ func phaseDLookback(t *testing.T) {
 	if !ts.After(boundary) {
 		t.Errorf("expected catch-up restart after missed boundary %v, got %v", boundary, ts)
 	}
+
+	p.stop()
+}
+
+func phaseEChainedRestarts(t *testing.T) {
+	applyFixtures(t)
+	p := startKairos(t, portChain, "-chain-timeout", "30s")
+
+	const (
+		head    = "erhudy-test-chain-head"
+		mid     = "erhudy-test-chain-mid"
+		tail    = "erhudy-test-chain-tail"
+		stuck   = "erhudy-test-chain-stuck"
+		blocked = "erhudy-test-chain-blocked"
+	)
+
+	baselines := map[string]string{
+		head:    getRestartAnnotation(t, "Deployment", ns1, head),
+		mid:     getRestartAnnotation(t, "StatefulSet", ns1, mid),
+		tail:    getRestartAnnotation(t, "Deployment", ns1, tail),
+		stuck:   getRestartAnnotation(t, "Deployment", ns1, stuck),
+		blocked: getRestartAnnotation(t, "Deployment", ns1, blocked),
+	}
+
+	t.Run("ConfigAndChainedRegistration", func(t *testing.T) {
+		cfg, err := fetchConfig(p.port)
+		if err != nil {
+			t.Fatalf("fetching /api/config: %v", err)
+		}
+		if cfg.ChainTimeout != "30s" {
+			t.Errorf("expected chain timeout 30s in config, got %q", cfg.ChainTimeout)
+		}
+
+		waitForJobsRegistered(t, p.port, [][2]string{{ns1, head}})
+
+		// pure followers have no cron jobs but must show up as chained entries
+		err = pollUntil(registrationTimeout, func() error {
+			entries, err := fetchJobs(p.port)
+			if err != nil {
+				return err
+			}
+			for _, w := range []struct{ name, after string }{
+				{mid, "deployment/" + head},
+				{tail, "statefulset/" + mid},
+				{stuck, "deployment/" + head},
+				{blocked, "deployment/" + stuck},
+			} {
+				var found *jobEntry
+				for i := range entries {
+					if strings.HasSuffix(entries[i].Resource, "/"+ns1+"/"+w.name) {
+						found = &entries[i]
+						break
+					}
+				}
+				if found == nil {
+					return fmt.Errorf("no chained entry for %s/%s yet", ns1, w.name)
+				}
+				if found.CronPattern != "" {
+					return fmt.Errorf("%s/%s should be a pure follower, got cron pattern %q", ns1, w.name, found.CronPattern)
+				}
+				if found.RestartAfter != w.after {
+					return fmt.Errorf("chained entry for %s/%s has restart-after %q, want %q", ns1, w.name, found.RestartAfter, w.after)
+				}
+			}
+			for _, e := range jobsFor(entries, ns1, tail) {
+				if e.RestartAfterMode != "health+wait" || e.RestartAfterWait != "30s" {
+					return fmt.Errorf("tail chained entry has mode %q wait %q, want health+wait 30s", e.RestartAfterMode, e.RestartAfterWait)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("chained entries not visible on /api/jobs: %v", err)
+		}
+	})
+
+	t.Run("CascadeOrdering", func(t *testing.T) {
+		g := newClockGuard(10 * time.Second)
+		boundary := nextMinuteBoundary()
+		waitUntil(boundary.Add(time.Second))
+		g.tick()
+
+		headTs := waitForRestart(t, g, "Deployment", ns1, head, baselines[head], 75*time.Second)
+		assertWindow(t, g, headTs, boundary, -2*time.Second, 40*time.Second)
+
+		midTs := waitForRestart(t, g, "StatefulSet", ns1, mid, baselines[mid], 90*time.Second)
+		if midTs.Before(headTs) {
+			t.Errorf("mid restarted at %v before head at %v; cascade must follow the predecessor", midTs, headTs)
+		}
+
+		stuckTs := waitForRestart(t, g, "Deployment", ns1, stuck, baselines[stuck], 90*time.Second)
+		if stuckTs.Before(headTs) {
+			t.Errorf("stuck restarted at %v before head at %v; cascade must follow the predecessor", stuckTs, headTs)
+		}
+
+		tailTs := waitForRestart(t, g, "Deployment", ns1, tail, baselines[tail], 3*time.Minute)
+		if tailTs.Before(midTs) {
+			t.Errorf("tail restarted at %v before mid at %v; cascade must follow the predecessor", tailTs, midTs)
+		}
+		if gap := tailTs.Sub(midTs); gap < 28*time.Second {
+			t.Errorf("tail fired only %v after mid; expected >= the 30s health-plus-wait (minus second-truncation slack)", gap)
+		}
+		assertWindow(t, g, tailTs, boundary, -2*time.Second, 4*time.Minute)
+	})
+
+	t.Run("TimeoutAbortsCascade", func(t *testing.T) {
+		g := newClockGuard(10 * time.Second)
+
+		// blocked waits on stuck, whose rollout never lands: its step must time out
+		var text string
+		err := pollUntil(3*time.Minute, func() error {
+			var err error
+			text, err = fetchMetrics(p.port)
+			if err != nil {
+				return err
+			}
+			v, ok := counterValue(text, "kairos_chain_steps_total", map[string]string{
+				"kind":      "Deployment",
+				"namespace": ns1,
+				"name":      blocked,
+				"outcome":   "timeout",
+			})
+			if !ok || v < 1 {
+				return fmt.Errorf("no timeout outcome recorded yet for %s/%s", ns1, blocked)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("waiting for chain timeout metric: %v", err)
+		}
+
+		// the abort must not cascade: blocked stays quiet across further head firings
+		assertNoRestart(t, g, "Deployment", ns1, blocked, baselines[blocked], 2*time.Minute)
+
+		text, err = fetchMetrics(p.port)
+		if err != nil {
+			t.Fatalf("fetching /metrics: %v", err)
+		}
+		for _, w := range []struct{ kind, name string }{
+			{"StatefulSet", mid},
+			{"Deployment", tail},
+			{"Deployment", stuck},
+		} {
+			v, ok := counterValue(text, "kairos_chain_steps_total", map[string]string{
+				"kind":      w.kind,
+				"namespace": ns1,
+				"name":      w.name,
+				"outcome":   "completed",
+			})
+			if !ok || v < 1 {
+				t.Errorf("expected completed chain step for %s/%s, got %v (found=%v)", ns1, w.name, v, ok)
+			}
+		}
+		vBlockedCompleted, _ := counterValue(text, "kairos_chain_steps_total", map[string]string{
+			"kind":      "Deployment",
+			"namespace": ns1,
+			"name":      blocked,
+			"outcome":   "completed",
+		})
+		if vBlockedCompleted != 0 {
+			t.Errorf("blocked must never complete a chain step, got %v completions", vBlockedCompleted)
+		}
+	})
+
+	t.Run("AnnotationRemovalStopsChain", func(t *testing.T) {
+		tailBaseline := getRestartAnnotation(t, "Deployment", ns1, tail)
+		midBaseline := getRestartAnnotation(t, "StatefulSet", ns1, mid)
+
+		removeWorkloadAnnotation(t, "Deployment", ns1, tail, restartAfterKey)
+
+		err := pollUntil(30*time.Second, func() error {
+			entries, err := fetchJobs(p.port)
+			if err != nil {
+				return err
+			}
+			if n := len(jobsFor(entries, ns1, tail)); n != 0 {
+				return fmt.Errorf("%d entries still registered for %s/%s", n, ns1, tail)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("tail not untracked after restart-after removal: %v", err)
+		}
+
+		g := newClockGuard(10 * time.Second)
+		boundary := nextMinuteBoundary()
+		waitUntil(boundary.Add(time.Second))
+		g.tick()
+
+		// the rest of the chain keeps firing...
+		midTs := waitForRestart(t, g, "StatefulSet", ns1, mid, midBaseline, 90*time.Second)
+		assertWindow(t, g, midTs, boundary, -2*time.Second, 95*time.Second)
+
+		// ...while the detached tail stays quiet well past when it used to fire (~mid+45s)
+		assertNoRestart(t, g, "Deployment", ns1, tail, tailBaseline, 75*time.Second)
+	})
 
 	p.stop()
 }

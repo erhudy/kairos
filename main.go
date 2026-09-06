@@ -47,6 +47,7 @@ func main() {
 	var metricsAddr string
 	var maxJitter time.Duration
 	var lookback time.Duration
+	var chainTimeout time.Duration
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
@@ -56,6 +57,7 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-addr", ":9090", "address to serve Prometheus metrics on")
 	flag.DurationVar(&maxJitter, "jitter", 0, "maximum random jitter to add before each restart (e.g. 15m); 0 disables jitter")
 	flag.DurationVar(&lookback, "lookback", 0, "how far back to check for missed restarts on startup (e.g. 30m); 0 disables")
+	flag.DurationVar(&chainTimeout, "chain-timeout", 10*time.Minute, "how long a chained restart waits for its predecessor to become healthy before aborting the cascade (e.g. 30m)")
 	flag.Parse()
 
 	var logger *zap.Logger
@@ -97,7 +99,7 @@ func main() {
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, workchan, metrics)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, workchan, metrics)
 
-	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback)
+	scheduler := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback, chainTimeout)
 
 	// listen synchronously so a bind failure fails fast before other components start;
 	// logger.Fatal here is safe because it runs on the main goroutine

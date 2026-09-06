@@ -61,6 +61,40 @@ func TestCareAboutThisObject(t *testing.T) {
 				},
 			},
 		},
+		{
+			testName: "restart-after only passes",
+			expected: true,
+			metaObject: &appsv1.Deployment{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Deployment",
+					APIVersion: "apps/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "follower",
+					Namespace: "what",
+					Annotations: map[string]string{
+						RESTART_AFTER_KEY: "deployment/hello",
+					},
+				},
+			},
+		},
+		{
+			testName: "empty restart-after fails",
+			expected: false,
+			metaObject: &appsv1.Deployment{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Deployment",
+					APIVersion: "apps/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "follower",
+					Namespace: "what",
+					Annotations: map[string]string{
+						RESTART_AFTER_KEY: "   ",
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -351,6 +385,143 @@ func TestCronPatternsString(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
 			require.Equal(t, tt.expected, tt.patterns.String())
+		})
+	}
+}
+
+func TestParsePredecessorRefs(t *testing.T) {
+	t.Parallel()
+
+	makeMeta := func(anns map[string]string) metav1.Object {
+		return &appsv1.Deployment{
+			TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "follower", Namespace: "ns1", Annotations: anns},
+		}
+	}
+
+	tests := []struct {
+		testName  string
+		value     string
+		expectErr bool
+		expected  []workloadRef
+	}{
+		{
+			testName: "single same-namespace ref",
+			value:    "deployment/head",
+			expected: []workloadRef{{kind: "Deployment", namespace: "ns1", name: "head", display: "deployment/head"}},
+		},
+		{
+			testName: "cross-namespace ref",
+			value:    "statefulset/other/db",
+			expected: []workloadRef{{kind: "StatefulSet", namespace: "other", name: "db", display: "statefulset/other/db"}},
+		},
+		{
+			testName: "mixed separators and whitespace",
+			value:    " deployment/a ; daemonset/b ,statefulset/ns2/c ",
+			expected: []workloadRef{
+				{kind: "Deployment", namespace: "ns1", name: "a", display: "deployment/a"},
+				{kind: "DaemonSet", namespace: "ns1", name: "b", display: "daemonset/b"},
+				{kind: "StatefulSet", namespace: "ns2", name: "c", display: "statefulset/ns2/c"},
+			},
+		},
+		{
+			testName: "case-insensitive kind, canonicalized in ref",
+			value:    "DEPLOYMENT/MixedCase",
+			expected: []workloadRef{{kind: "Deployment", namespace: "ns1", name: "MixedCase", display: "deployment/MixedCase"}},
+		},
+		{
+			testName:  "unknown kind",
+			value:     "pod/foo",
+			expectErr: true,
+		},
+		{
+			testName:  "single segment",
+			value:     "foo",
+			expectErr: true,
+		},
+		{
+			testName:  "four segments",
+			value:     "deployment/ns/name/extra",
+			expectErr: true,
+		},
+		{
+			testName:  "empty name",
+			value:     "deployment/",
+			expectErr: true,
+		},
+		{
+			testName:  "empty namespace in three-segment form",
+			value:     "deployment//name",
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			refs, err := parsePredecessorRefs(makeMeta(map[string]string{RESTART_AFTER_KEY: tt.value}))
+			if tt.expectErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.expected, refs)
+		})
+	}
+
+	t.Run("no annotation returns no refs", func(t *testing.T) {
+		refs, err := parsePredecessorRefs(makeMeta(nil))
+		require.NoError(t, err)
+		require.Nil(t, refs)
+	})
+}
+
+func TestParseResourceIdentifier(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		testName string
+		ri       resourceIdentifier
+		expectOK bool
+		kind     string
+		ns       string
+		name     string
+	}{
+		{
+			testName: "deployment",
+			ri:       "apps/v1, Kind=Deployment/ns1/dep1",
+			expectOK: true, kind: "Deployment", ns: "ns1", name: "dep1",
+		},
+		{
+			testName: "statefulset in kube-system",
+			ri:       "apps/v1, Kind=StatefulSet/kube-system/db",
+			expectOK: true, kind: "StatefulSet", ns: "kube-system", name: "db",
+		},
+		{
+			testName: "missing Kind marker",
+			ri:       "apps/v1/ns1/dep1",
+			expectOK: false,
+		},
+		{
+			testName: "too few segments",
+			ri:       "apps/v1, Kind=Deployment/ns1",
+			expectOK: false,
+		},
+		{
+			testName: "empty segment",
+			ri:       "apps/v1, Kind=Deployment//dep1",
+			expectOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			kind, ns, name, ok := parseResourceIdentifier(tt.ri)
+			require.Equal(t, tt.expectOK, ok)
+			if tt.expectOK {
+				require.Equal(t, tt.kind, kind)
+				require.Equal(t, tt.ns, ns)
+				require.Equal(t, tt.name, name)
+			}
 		})
 	}
 }

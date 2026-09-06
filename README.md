@@ -18,6 +18,33 @@ Kairos starts up with the scheduler running on local time by default, determined
 
 Timezones for particular jobs may be set by prefixing each cron pattern with `TZ=` or `CRON_TZ=`, e.g. `TZ=America/New_York 5 12 * * *`.
 
+### Chained restarts
+
+Some things only make sense to restart in order: the cache before the app, the app before the worker that drains it. Kairos can chain restarts so that a resource comes back after something else's restart has landed, rather than on its own schedule.
+
+Add `kairos.erhudy.com/restart-after` to a resource naming its predecessor(s). When Kairos successfully restarts a resource, each follower waits for the predecessor's rollout to complete again and is then restarted itself — which in turn triggers that follower's own followers (X → Y → Z). Catch-up restarts from `-lookback` propagate through chains just like scheduled ones.
+
+By default (`health` mode) the follower fires as soon as the predecessor reports a completed rollout; if the predecessor does not become healthy within `-chain-timeout` (default 10m), that step is aborted and the cascade stops there rather than restarting onto an unhealthy dependency. `health-plus-wait` adds a fixed settling delay after health is reached before firing.
+
+```yaml
+metadata:
+  annotations:
+    kairos.erhudy.com/restart-after: deployment/redis-cache            # same namespace
+    kairos.erhudy.com/restart-after-mode: health-plus-wait             # default: health
+    kairos.erhudy.com/restart-after-wait: 30s                          # required for health-plus-wait
+```
+
+Chains compose entirely from per-resource annotations; cycles are rejected at registration with a logged error. Chained step outcomes are counted by the `kairos_chain_steps_total{kind,namespace,name,outcome}` metric (`completed`, `timeout`, or `aborted`), and pure followers appear on the job-status page without a cron pattern.
+
+### Annotation reference
+
+| Annotation | Meaning |
+| --- | --- |
+| `kairos.erhudy.com/cron-pattern` | Restart schedule: 5- or 6-field cron, semicolon-separated multiples, optional per-pattern `TZ=`/`CRON_TZ=` prefix |
+| `kairos.erhudy.com/restart-after` | Predecessor(s) to follow: comma/semicolon-separated `kind/name` (same namespace) or `kind/namespace/name`, kind one of `deployment`, `daemonset`, `statefulset` |
+| `kairos.erhudy.com/restart-after-mode` | `health` (default) or `health-plus-wait` |
+| `kairos.erhudy.com/restart-after-wait` | Post-health settling delay; required for `health-plus-wait`, invalid with `health` |
+
 ## Installing
 
 Use the Kustomize directory at `deploy`:

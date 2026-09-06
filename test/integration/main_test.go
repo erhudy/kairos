@@ -18,6 +18,7 @@ import (
 
 const (
 	cronPatternKey      = "kairos.erhudy.com/cron-pattern"
+	restartAfterKey     = "kairos.erhudy.com/restart-after"
 	restartedAtKey      = "kairos.erhudy.com/cron-last-restarted-at"
 	timeFormat          = time.RFC3339
 	pollInterval        = 2 * time.Second

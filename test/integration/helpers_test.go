@@ -119,17 +119,21 @@ func applyFixtures(t *testing.T) {
 // --- HTTP API ---
 
 type jobEntry struct {
-	Resource    string `json:"resource"`
-	CronPattern string `json:"cronPattern"`
-	LastRun     string `json:"lastRun"`
-	NextRun     string `json:"nextRun"`
-	LastJitter  string `json:"lastJitter"`
+	Resource         string `json:"resource"`
+	CronPattern      string `json:"cronPattern"`
+	LastRun          string `json:"lastRun"`
+	NextRun          string `json:"nextRun"`
+	LastJitter       string `json:"lastJitter"`
+	RestartAfter     string `json:"restartAfter"`
+	RestartAfterMode string `json:"restartAfterMode"`
+	RestartAfterWait string `json:"restartAfterWait"`
 }
 
 type configEntry struct {
-	Timezone string `json:"timezone"`
-	Jitter   string `json:"jitter"`
-	Lookback string `json:"lookback"`
+	Timezone     string `json:"timezone"`
+	Jitter       string `json:"jitter"`
+	Lookback     string `json:"lookback"`
+	ChainTimeout string `json:"chainTimeout"`
 }
 
 func fetchJobs(port int) ([]jobEntry, error) {
@@ -242,22 +246,45 @@ func getRestartAnnotation(t *testing.T, kind, ns, name string) string {
 	}
 }
 
-func removeCronAnnotation(t *testing.T, kind, ns, name string) {
+// removeWorkloadAnnotation deletes the given metadata annotations from a workload.
+func removeWorkloadAnnotation(t *testing.T, kind, ns, name string, keys ...string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	del := func(anns map[string]string) {
+		for _, k := range keys {
+			delete(anns, k)
+		}
+	}
+	var err error
 	switch kind {
 	case "Deployment":
-		obj, err := clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("getting Deployment: %v", err)
+		obj, gerr := clientset.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if gerr != nil {
+			t.Fatalf("getting Deployment %s/%s: %v", ns, name, gerr)
 		}
-		delete(obj.Annotations, cronPatternKey)
-		if _, err := clientset.AppsV1().Deployments(ns).Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
-			t.Fatalf("removing annotation: %v", err)
+		del(obj.Annotations)
+		_, err = clientset.AppsV1().Deployments(ns).Update(ctx, obj, metav1.UpdateOptions{})
+	case "DaemonSet":
+		obj, gerr := clientset.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if gerr != nil {
+			t.Fatalf("getting DaemonSet %s/%s: %v", ns, name, gerr)
 		}
+		del(obj.Annotations)
+		_, err = clientset.AppsV1().DaemonSets(ns).Update(ctx, obj, metav1.UpdateOptions{})
+	case "StatefulSet":
+		obj, gerr := clientset.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if gerr != nil {
+			t.Fatalf("getting StatefulSet %s/%s: %v", ns, name, gerr)
+		}
+		del(obj.Annotations)
+		_, err = clientset.AppsV1().StatefulSets(ns).Update(ctx, obj, metav1.UpdateOptions{})
 	default:
-		t.Fatalf("removeCronAnnotation not implemented for kind %q", kind)
+		t.Fatalf("removeWorkloadAnnotation not implemented for kind %q", kind)
+	}
+	if err != nil {
+		t.Fatalf("removing annotations %v from %s %s/%s: %v", keys, kind, ns, name, err)
 	}
 }
 

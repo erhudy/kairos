@@ -17,31 +17,36 @@ import (
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
-func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface, metrics *KairosMetrics, maxJitter time.Duration, lookback time.Duration) *Scheduler {
+func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan ObjectAndSchedulerAction, clientset kubernetes.Interface, metrics *KairosMetrics, maxJitter time.Duration, lookback time.Duration, chainTimeout time.Duration) *Scheduler {
 	scheduler := gocron.NewScheduler(timezone)
 	scheduler.TagsUnique()
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 
 	return &Scheduler{
-		logger:         logger,
-		workchan:       workchan,
-		cron:           scheduler,
-		clientset:      clientset,
-		resourceMap:    &sync.Map{},
-		metrics:        metrics,
-		maxJitter:      maxJitter,
-		lookback:       lookback,
-		timezone:       timezone,
-		startTime:      time.Now(),
-		shutdownCtx:    shutdownCtx,
-		shutdownCancel: shutdownCancel,
+		logger:            logger,
+		workchan:          workchan,
+		cron:              scheduler,
+		clientset:         clientset,
+		resourceMap:       &sync.Map{},
+		metrics:           metrics,
+		maxJitter:         maxJitter,
+		lookback:          lookback,
+		timezone:          timezone,
+		chainTimeout:      chainTimeout,
+		chainPollInterval: CHAIN_POLL_INTERVAL,
+		chainMap:          &sync.Map{},
+		pendingSteps:      &sync.Map{},
+		startTime:         time.Now(),
+		shutdownCtx:       shutdownCtx,
+		shutdownCancel:    shutdownCancel,
 	}
 }
 
@@ -63,17 +68,40 @@ func (s *Scheduler) Run(stopCh chan struct{}) {
 }
 
 type jobStatusEntry struct {
-	Resource    string `json:"resource"`
-	CronPattern string `json:"cronPattern"`
-	LastRun     string `json:"lastRun"`
-	NextRun     string `json:"nextRun"`
-	LastJitter  string `json:"lastJitter"`
+	Resource         string `json:"resource"`
+	CronPattern      string `json:"cronPattern"`
+	LastRun          string `json:"lastRun"`
+	NextRun          string `json:"nextRun"`
+	LastJitter       string `json:"lastJitter"`
+	RestartAfter     string `json:"restartAfter,omitempty"`
+	RestartAfterMode string `json:"restartAfterMode,omitempty"`
+	RestartAfterWait string `json:"restartAfterWait,omitempty"`
+}
+
+// chainAnnotationsFrom returns the display strings for the restart-after annotations
+// on obj, or empty strings when it has none.
+func chainAnnotationsFrom(obj runtime.Object) (after, mode, wait string) {
+	om, _ := getObjectMetaAndKind(obj)
+	anns := om.GetAnnotations()
+	after = strings.TrimSpace(anns[RESTART_AFTER_KEY])
+	if after == "" {
+		return "", "", ""
+	}
+	switch strings.TrimSpace(anns[RESTART_AFTER_MODE_KEY]) {
+	case CHAIN_MODE_HEALTH_PLUS_WAIT:
+		mode = CHAIN_MODE_DISPLAY_PLUS_WAIT
+	default:
+		mode = CHAIN_MODE_DISPLAY_HEALTH
+	}
+	wait = strings.TrimSpace(anns[RESTART_AFTER_WAIT_KEY])
+	return after, mode, wait
 }
 
 type configStatus struct {
-	Timezone string `json:"timezone"`
-	Jitter   string `json:"jitter"`
-	Lookback string `json:"lookback"`
+	Timezone     string `json:"timezone"`
+	Jitter       string `json:"jitter"`
+	Lookback     string `json:"lookback"`
+	ChainTimeout string `json:"chainTimeout"`
 }
 
 func (s *Scheduler) ConfigJSON(w http.ResponseWriter, r *http.Request) {
@@ -86,9 +114,10 @@ func (s *Scheduler) ConfigJSON(w http.ResponseWriter, r *http.Request) {
 		lookback = s.lookback.String()
 	}
 	cfg := configStatus{
-		Timezone: s.timezone.String(),
-		Jitter:   jitter,
-		Lookback: lookback,
+		Timezone:     s.timezone.String(),
+		Jitter:       jitter,
+		Lookback:     lookback,
+		ChainTimeout: s.chainTimeout.String(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(cfg); err != nil {
@@ -98,6 +127,7 @@ func (s *Scheduler) ConfigJSON(w http.ResponseWriter, r *http.Request) {
 
 func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
 	var entries []jobStatusEntry
+	emittedRi := map[resourceIdentifier]struct{}{}
 
 	s.resourceMap.Range(func(key, value any) bool {
 		ri := key.(resourceIdentifier)
@@ -105,21 +135,61 @@ func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
 		entry.RLock()
 		defer entry.RUnlock()
 		lastRunStr := getPodTemplateAnnotation(entry.obj, CRON_LAST_RESTARTED_AT_KEY)
+		after, mode, wait := chainAnnotationsFrom(entry.obj)
 		for cp, job := range entry.jobs {
 			lastJitterStr := ""
 			if j, ok := entry.lastJitters[cp]; ok && j > 0 {
 				lastJitterStr = j.Round(time.Millisecond).String()
 			}
 			entries = append(entries, jobStatusEntry{
-				Resource:    string(ri),
-				CronPattern: string(cp),
-				LastRun:     lastRunStr,
-				NextRun:     job.NextRun().UTC().Format(time.RFC3339),
-				LastJitter:  lastJitterStr,
+				Resource:         string(ri),
+				CronPattern:      string(cp),
+				LastRun:          lastRunStr,
+				NextRun:          job.NextRun().UTC().Format(time.RFC3339),
+				LastJitter:       lastJitterStr,
+				RestartAfter:     after,
+				RestartAfterMode: mode,
+				RestartAfterWait: wait,
 			})
+		}
+		if len(entry.jobs) > 0 {
+			emittedRi[ri] = struct{}{}
 		}
 		return true
 	})
+
+	// pure followers (restart-after with no cron jobs of their own) have no job
+	// entries; walk the chain edges so they are still visible on the status page,
+	// aggregated per follower across all of its predecessors
+	chained := map[resourceIdentifier]*jobStatusEntry{}
+	var chainedOrder []resourceIdentifier
+	s.chainMap.Range(func(_, value any) bool {
+		entry := value.(*chainMapEntry)
+		entry.RLock()
+		defer entry.RUnlock()
+		for _, edge := range entry.edges {
+			if _, ok := emittedRi[edge.followerRi]; ok {
+				continue
+			}
+			existing, seen := chained[edge.followerRi]
+			if !seen {
+				chained[edge.followerRi] = &jobStatusEntry{
+					Resource:         string(edge.followerRi),
+					LastRun:          getPodTemplateAnnotation(edge.obj, CRON_LAST_RESTARTED_AT_KEY),
+					RestartAfter:     edgeDisplay(edge),
+					RestartAfterMode: chainModeDisplay(edge.mode),
+					RestartAfterWait: chainWaitDisplay(edge),
+				}
+				chainedOrder = append(chainedOrder, edge.followerRi)
+			} else {
+				existing.RestartAfter += ", " + edgeDisplay(edge)
+			}
+		}
+		return true
+	})
+	for _, ri := range chainedOrder {
+		entries = append(entries, *chained[ri])
+	}
 
 	if entries == nil {
 		entries = []jobStatusEntry{}
@@ -129,6 +199,24 @@ func (s *Scheduler) JobStatusJSON(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(entries); err != nil {
 		s.logger.Error("error encoding job status JSON", zap.Error(err))
 	}
+}
+
+func edgeDisplay(edge *chainEdge) string {
+	return edge.predecessor.display
+}
+
+func chainModeDisplay(mode chainMode) string {
+	if mode == chainModeHealthPlusWait {
+		return CHAIN_MODE_DISPLAY_PLUS_WAIT
+	}
+	return CHAIN_MODE_DISPLAY_HEALTH
+}
+
+func chainWaitDisplay(edge *chainEdge) string {
+	if edge.mode == chainModeHealthPlusWait && edge.wait > 0 {
+		return edge.wait.String()
+	}
+	return ""
 }
 
 //go:embed job_status.html
@@ -171,7 +259,7 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 
 	// load the cron patterns on the job
 	pattern := getCronPatternString(objm)
-	if pattern == "" {
+	if pattern == "" && !hasChainAnnotations(objm) {
 		s.logger.Debug("cron expression was empty, removing any registered jobs", zap.String("resource", string(ri)))
 		return s.deleteJobsForResource(obj)
 	}
@@ -255,6 +343,8 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		}
 	}
 
+	s.reconcileChainEdges(obj)
+
 	return nil
 }
 
@@ -279,8 +369,6 @@ func (s *Scheduler) getOrCreateEntry(ri resourceIdentifier, obj runtime.Object) 
 
 // creates/updates the job (by deleting/recreating) and returns it for inspection
 func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime.Object) error {
-	ctx := context.Background()
-
 	cpString := string(cp)
 
 	var job *gocron.Job
@@ -332,7 +420,7 @@ func (s *Scheduler) createJob(cp cronPattern, ri resourceIdentifier, obj runtime
 				return
 			}
 		}
-		restartFunc(ctx, s.logger, s.clientset, obj, s.metrics)
+		s.fireRestart(obj)
 	})
 	if err != nil {
 		return fmt.Errorf("error in createJob during creation: %w", err)
@@ -398,6 +486,11 @@ func (s *Scheduler) jobStillRegistered(cp cronPattern, ri resourceIdentifier) bo
 func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	objm, objk := getObjectMetaAndKind(obj)
 	ri := getResourceIdentifier(objm, objk)
+
+	// a resource that is gone or no longer annotated must not remain in the chain
+	// graph: neither as a firing source for others nor as a follower awaiting one
+	s.chainMap.Delete(ri)
+	s.removeChainEdgesForFollower(ri)
 
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
@@ -607,11 +700,449 @@ func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, 
 				return
 			}
 		}
-		restartFunc(context.Background(), s.logger, s.clientset, obj, s.metrics)
+		s.fireRestart(obj)
 	}()
 }
 
-func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, incomingObject runtime.Object, metrics *KairosMetrics) {
+// fireRestart patches the pod template annotation on obj and, when the patch
+// succeeds, triggers any chained followers registered for it.
+func (s *Scheduler) fireRestart(obj runtime.Object) {
+	if !restartFunc(context.Background(), s.logger, s.clientset, obj, s.metrics) {
+		return
+	}
+	om, objk := getObjectMetaAndKind(obj)
+	s.triggerFollowers(getResourceIdentifier(om, objk))
+}
+
+// triggerFollowers spawns one chain step per follower registered under predRi,
+// deduped to a single in-flight step per follower.
+func (s *Scheduler) triggerFollowers(predRi resourceIdentifier) {
+	raw, ok := s.chainMap.Load(predRi)
+	if !ok {
+		return
+	}
+	entry := raw.(*chainMapEntry)
+	entry.RLock()
+	edges := make([]*chainEdge, 0, len(entry.edges))
+	for _, edge := range entry.edges {
+		edges = append(edges, edge)
+	}
+	entry.RUnlock()
+
+	for _, edge := range edges {
+		if _, loaded := s.pendingSteps.LoadOrStore(edge.followerRi, struct{}{}); loaded {
+			s.logger.Debug("chain step already in flight for follower, skipping trigger",
+				zap.String("predecessor", string(predRi)),
+				zap.String("follower", string(edge.followerRi)),
+			)
+			continue
+		}
+		go s.runChainStep(predRi, edge)
+	}
+}
+
+// runChainStep waits for the predecessor's restart to settle (its rollout to
+// complete again, optionally plus a fixed wait) and then restarts the follower,
+// which recursively triggers the follower's own followers.
+func (s *Scheduler) runChainStep(predRi resourceIdentifier, edge *chainEdge) {
+	defer s.pendingSteps.Delete(edge.followerRi)
+
+	fKind, fNs, fName, ok := parseResourceIdentifier(edge.followerRi)
+	if !ok {
+		s.logger.Error("chain step has malformed follower identifier, aborting", zap.String("follower", string(edge.followerRi)))
+		return
+	}
+	record := func(outcome string) {
+		if s.metrics != nil {
+			s.metrics.ChainStepsTotal.WithLabelValues(fKind, fNs, fName, outcome).Inc()
+		}
+	}
+	abort := func(reason string) {
+		s.logger.Info("chain step aborted",
+			zap.String("predecessor", string(predRi)),
+			zap.String("follower", string(edge.followerRi)),
+			zap.String("reason", reason),
+		)
+		record(CHAIN_OUTCOME_ABORTED)
+	}
+
+	s.logger.Info("chain step waiting for predecessor to become healthy",
+		zap.String("predecessor", string(predRi)),
+		zap.String("follower", string(edge.followerRi)),
+	)
+
+	deadline := time.Now().Add(s.chainTimeout)
+	for {
+		select {
+		case <-s.shutdownCtx.Done():
+			abort("shutdown")
+			return
+		default:
+		}
+		if !s.edgeStillRegistered(predRi, edge.followerRi) {
+			abort("edge removed")
+			return
+		}
+
+		predObj, err := s.getWorkload(edge.predecessor)
+		switch {
+		case apierrors.IsNotFound(err):
+			abort("predecessor deleted")
+			return
+		case err != nil:
+			s.logger.Warn("error checking predecessor health, will retry",
+				zap.String("predecessor", string(predRi)),
+				zap.Error(err),
+			)
+		case isRolloutComplete(predObj):
+			s.logger.Info("predecessor healthy again", zap.String("predecessor", string(predRi)))
+			if edge.mode == chainModeHealthPlusWait {
+				if !s.chainSettleWait(edge, predRi) {
+					return
+				}
+			}
+			freshObj, err := s.getWorkload(workloadRef{kind: fKind, namespace: fNs, name: fName})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					abort("follower deleted")
+				} else {
+					s.logger.Error("error fetching fresh follower object", zap.String("follower", string(edge.followerRi)), zap.Error(err))
+					record(CHAIN_OUTCOME_ABORTED)
+				}
+				return
+			}
+			if restartFunc(context.Background(), s.logger, s.clientset, freshObj, s.metrics) {
+				s.triggerFollowers(edge.followerRi)
+				s.refreshChainEdgeObject(predRi, edge.followerRi)
+				record(CHAIN_OUTCOME_COMPLETED)
+			} else {
+				abort("follower restart failed")
+			}
+			return
+		}
+
+		if !time.Now().Before(deadline) {
+			s.logger.Error("chain step timed out waiting for predecessor to become healthy, aborting cascade",
+				zap.String("predecessor", string(predRi)),
+				zap.String("follower", string(edge.followerRi)),
+				zap.Duration("timeout", s.chainTimeout),
+			)
+			record(CHAIN_OUTCOME_TIMEOUT)
+			return
+		}
+
+		select {
+		case <-time.After(s.chainPollInterval):
+		case <-s.shutdownCtx.Done():
+			abort("shutdown")
+			return
+		}
+	}
+}
+
+// chainSettleWait sleeps the configured post-health wait for a health-plus-wait
+// edge, re-checking shutdown and edge registration around the sleep like the
+// jitter path does. Returns false if the step should abort.
+func (s *Scheduler) chainSettleWait(edge *chainEdge, predRi resourceIdentifier) bool {
+	select {
+	case <-s.shutdownCtx.Done():
+		return false
+	default:
+	}
+	if !s.edgeStillRegistered(predRi, edge.followerRi) {
+		return false
+	}
+	s.logger.Info("applying post-health wait before chained restart",
+		zap.String("predecessor", string(predRi)),
+		zap.String("follower", string(edge.followerRi)),
+		zap.Duration("wait", edge.wait),
+	)
+	select {
+	case <-time.After(edge.wait):
+	case <-s.shutdownCtx.Done():
+		return false
+	}
+	return s.edgeStillRegistered(predRi, edge.followerRi)
+}
+
+func (s *Scheduler) getWorkload(ref workloadRef) (runtime.Object, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), API_CALL_TIMEOUT)
+	defer cancel()
+	opts := metav1.GetOptions{}
+	switch ref.kind {
+	case "Deployment":
+		return s.clientset.AppsV1().Deployments(ref.namespace).Get(ctx, ref.name, opts)
+	case "DaemonSet":
+		return s.clientset.AppsV1().DaemonSets(ref.namespace).Get(ctx, ref.name, opts)
+	case "StatefulSet":
+		return s.clientset.AppsV1().StatefulSets(ref.namespace).Get(ctx, ref.name, opts)
+	default:
+		return nil, fmt.Errorf("unsupported kind %q in workload ref", ref.kind)
+	}
+}
+
+func (s *Scheduler) reconcileChainEdges(obj runtime.Object) {
+	om, objk := getObjectMetaAndKind(obj)
+	ri := getResourceIdentifier(om, objk)
+
+	// rebuild from scratch so removed/invalid annotations drop stale edges; the
+	// desired set is re-registered below when valid
+	s.removeChainEdgesForFollower(ri)
+
+	if !hasChainAnnotations(om) {
+		return
+	}
+
+	refs, err := parsePredecessorRefs(om)
+	if err != nil {
+		s.logger.Error("invalid restart-after annotation, skipping chain edges", zap.String("resource", string(ri)), zap.Error(err))
+		return
+	}
+
+	modeStr := strings.TrimSpace(om.GetAnnotations()[RESTART_AFTER_MODE_KEY])
+	var mode chainMode
+	switch modeStr {
+	case "", CHAIN_MODE_HEALTH:
+		mode = chainModeHealth
+	case CHAIN_MODE_HEALTH_PLUS_WAIT:
+		mode = chainModeHealthPlusWait
+	default:
+		s.logger.Error("invalid restart-after-mode, skipping chain edges", zap.String("resource", string(ri)), zap.String("mode", modeStr))
+		return
+	}
+
+	waitStr := strings.TrimSpace(om.GetAnnotations()[RESTART_AFTER_WAIT_KEY])
+	var wait time.Duration
+	if waitStr != "" {
+		d, err := time.ParseDuration(waitStr)
+		if err != nil || d <= 0 {
+			s.logger.Error("invalid restart-after-wait, skipping chain edges", zap.String("resource", string(ri)), zap.String("wait", waitStr), zap.Error(err))
+			return
+		}
+		wait = d
+	}
+	switch mode {
+	case chainModeHealth:
+		if waitStr != "" {
+			s.logger.Error("restart-after-wait is only valid with restart-after-mode health-plus-wait, skipping chain edges", zap.String("resource", string(ri)))
+			return
+		}
+	case chainModeHealthPlusWait:
+		if waitStr == "" {
+			s.logger.Error("restart-after-wait is required with restart-after-mode health-plus-wait, skipping chain edges", zap.String("resource", string(ri)))
+			return
+		}
+	}
+
+	for _, ref := range refs {
+		predRi := ref.identifier()
+		if s.wouldCreateCycle(ri, predRi) {
+			s.logger.Error("skipping chain edge that would create a cycle",
+				zap.String("follower", string(ri)),
+				zap.String("predecessor", string(predRi)),
+			)
+			continue
+		}
+		entry := s.getOrCreateChainEntry(predRi)
+		entry.Lock()
+		entry.edges[ri] = &chainEdge{
+			predecessor: ref,
+			followerRi:  ri,
+			obj:         obj,
+			mode:        mode,
+			wait:        wait,
+		}
+		entry.Unlock()
+		s.logger.Info("registered chain edge",
+			zap.String("follower", string(ri)),
+			zap.String("predecessor", string(predRi)),
+			zap.String("mode", chainModeDisplay(mode)),
+		)
+	}
+}
+
+func (s *Scheduler) getOrCreateChainEntry(predRi resourceIdentifier) *chainMapEntry {
+	raw, ok := s.chainMap.Load(predRi)
+	if ok {
+		return raw.(*chainMapEntry)
+	}
+	entry := &chainMapEntry{edges: map[resourceIdentifier]*chainEdge{}}
+	actual, _ := s.chainMap.LoadOrStore(predRi, entry)
+	return actual.(*chainMapEntry)
+}
+
+func (s *Scheduler) removeChainEdgesForFollower(followerRi resourceIdentifier) {
+	s.chainMap.Range(func(key, value any) bool {
+		entry := value.(*chainMapEntry)
+		entry.Lock()
+		if _, ok := entry.edges[followerRi]; ok {
+			delete(entry.edges, followerRi)
+			if len(entry.edges) == 0 {
+				s.chainMap.Delete(key)
+			}
+		}
+		entry.Unlock()
+		return true
+	})
+}
+
+func (s *Scheduler) edgeStillRegistered(predRi, followerRi resourceIdentifier) bool {
+	raw, ok := s.chainMap.Load(predRi)
+	if !ok {
+		return false
+	}
+	entry := raw.(*chainMapEntry)
+	entry.RLock()
+	defer entry.RUnlock()
+	_, ok = entry.edges[followerRi]
+	return ok
+}
+
+// refreshChainEdgeObject re-fetches the follower after a chained restart so the
+// status page shows its updated last-restart timestamp.
+func (s *Scheduler) refreshChainEdgeObject(predRi, followerRi resourceIdentifier) {
+	kind, ns, name, ok := parseResourceIdentifier(followerRi)
+	if !ok {
+		return
+	}
+	obj, err := s.getWorkload(workloadRef{kind: kind, namespace: ns, name: name})
+	if err != nil {
+		return
+	}
+	raw, ok := s.chainMap.Load(predRi)
+	if !ok {
+		return
+	}
+	entry := raw.(*chainMapEntry)
+	entry.Lock()
+	if edge, exists := entry.edges[followerRi]; exists {
+		edge.obj = obj
+	}
+	entry.Unlock()
+}
+
+// wouldCreateCycle reports whether adding the edge predRi→followerRi would close
+// a cycle, i.e. whether predRi is reachable from followerRi by following
+// existing predecessor→follower edges.
+func (s *Scheduler) wouldCreateCycle(followerRi, predRi resourceIdentifier) bool {
+	if followerRi == predRi {
+		return true
+	}
+	visited := map[resourceIdentifier]struct{}{followerRi: {}}
+	stack := []resourceIdentifier{followerRi}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		raw, ok := s.chainMap.Load(cur)
+		if !ok {
+			continue
+		}
+		entry := raw.(*chainMapEntry)
+		entry.RLock()
+		found := false
+		for next := range entry.edges {
+			if next == predRi {
+				found = true
+				break
+			}
+			if _, seen := visited[next]; !seen {
+				visited[next] = struct{}{}
+				stack = append(stack, next)
+			}
+		}
+		entry.RUnlock()
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// isRolloutComplete reports whether a workload's most recent rollout has fully
+// landed: the status controller has observed the current spec and every desired
+// replica is updated, ready, and (for Deployments) free of terminating old pods.
+func isRolloutComplete(obj runtime.Object) bool {
+	switch o := obj.(type) {
+	case *appsv1.Deployment:
+		return deploymentRolloutComplete(o)
+	case *appsv1.DaemonSet:
+		return daemonSetRolloutComplete(o)
+	case *appsv1.StatefulSet:
+		return statefulSetRolloutComplete(o)
+	default:
+		return false
+	}
+}
+
+func deploymentRolloutComplete(d *appsv1.Deployment) bool {
+	if d.Spec.Paused {
+		return false
+	}
+	if d.Status.ObservedGeneration < d.Generation {
+		return false
+	}
+	desired := int32(1)
+	if d.Spec.Replicas != nil {
+		desired = *d.Spec.Replicas
+	}
+	if desired == 0 {
+		return true
+	}
+	if d.Status.UpdatedReplicas < desired {
+		return false
+	}
+	// old pods still terminating: replicas exceed the updated set until they drain
+	if d.Status.Replicas > d.Status.UpdatedReplicas {
+		return false
+	}
+	if d.Status.AvailableReplicas < d.Status.UpdatedReplicas {
+		return false
+	}
+	return true
+}
+
+func statefulSetRolloutComplete(sts *appsv1.StatefulSet) bool {
+	if sts.Status.ObservedGeneration < sts.Generation {
+		return false
+	}
+	desired := int32(1)
+	if sts.Spec.Replicas != nil {
+		desired = *sts.Spec.Replicas
+	}
+	if desired == 0 {
+		return true
+	}
+	if sts.Status.UpdatedReplicas < desired {
+		return false
+	}
+	if sts.Status.ReadyReplicas < desired {
+		return false
+	}
+	if sts.Status.CurrentRevision != sts.Status.UpdateRevision {
+		return false
+	}
+	return true
+}
+
+func daemonSetRolloutComplete(ds *appsv1.DaemonSet) bool {
+	if ds.Status.ObservedGeneration < ds.Generation {
+		return false
+	}
+	desired := ds.Status.DesiredNumberScheduled
+	if desired == 0 {
+		return true
+	}
+	if ds.Status.UpdatedNumberScheduled < desired {
+		return false
+	}
+	if ds.Status.NumberReady < desired {
+		return false
+	}
+	return true
+}
+
+func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, incomingObject runtime.Object, metrics *KairosMetrics) bool {
 	logger.Debug("entering restartFunc")
 
 	om, _ := getObjectMetaAndKind(incomingObject)
@@ -629,7 +1160,7 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 
 	supported, err := patchPodTemplateAnnotation(ctx, logger, clientset, incomingObject, CRON_LAST_RESTARTED_AT_KEY, now)
 	if !supported {
-		return
+		return false
 	}
 
 	if metrics != nil {
@@ -641,11 +1172,13 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 		if metrics != nil {
 			metrics.RestartErrorsTotal.WithLabelValues(kind, namespace, name, "patch").Inc()
 		}
-	} else {
-		if metrics != nil {
-			metrics.RestartTotal.WithLabelValues(kind, namespace, name).Inc()
-		}
+		return false
 	}
+
+	if metrics != nil {
+		metrics.RestartTotal.WithLabelValues(kind, namespace, name).Inc()
+	}
+	return true
 }
 
 // patchPodTemplateAnnotation sets a single annotation on the workload's pod template via a

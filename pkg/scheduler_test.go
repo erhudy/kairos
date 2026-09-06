@@ -2,6 +2,8 @@ package pkg
 
 import (
 	"context"
+	"encoding/json"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -32,7 +34,17 @@ func newTestSchedulerWithLookback(t *testing.T, lookback time.Duration, objects 
 	tz, err := time.LoadLocation("")
 	require.NoError(t, err)
 	ch := make(chan ObjectAndSchedulerAction, 10)
-	s := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback)
+	s := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback, 10*time.Minute)
+	return s, clientset
+}
+
+// newTestSchedulerWithChain creates a Scheduler with chain support tuned for
+// fast unit tests: short timeout and health-poll interval.
+func newTestSchedulerWithChain(t *testing.T, chainTimeout time.Duration, objects ...runtime.Object) (*Scheduler, *fake.Clientset) {
+	t.Helper()
+	s, clientset := newTestSchedulerWithLookback(t, 0, objects...)
+	s.chainTimeout = chainTimeout
+	s.chainPollInterval = 10 * time.Millisecond
 	return s, clientset
 }
 
@@ -465,7 +477,7 @@ func TestDeleteJobsForResource(t *testing.T) {
 		tz, err := time.LoadLocation("")
 		require.NoError(t, err)
 		metrics := NewKairosMetrics()
-		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0)
+		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, metrics, 0, 0, 10*time.Minute)
 		s.cron.StartAsync()
 		defer s.cron.Stop()
 
@@ -751,7 +763,7 @@ func TestCheckMissedRestart(t *testing.T) {
 		clientset := fake.NewClientset(dep)
 		tz, err := time.LoadLocation("")
 		require.NoError(t, err)
-		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute)
+		s := NewScheduler(tz, zap.NewNop(), make(chan ObjectAndSchedulerAction, 10), clientset, nil, 500*time.Millisecond, 30*time.Minute, 10*time.Minute)
 		s.cron.StartAsync()
 		defer s.cron.Stop()
 
@@ -1000,4 +1012,623 @@ func TestSchedulerEndToEnd(t *testing.T) {
 			require.WithinRange(t, parsed, startTime, time.Now().Add(time.Second))
 		})
 	}
+}
+
+// --- Chain restarts ---
+
+func riOf(obj runtime.Object) resourceIdentifier {
+	om, ok := getObjectMetaAndKind(obj)
+	return getResourceIdentifier(om, ok)
+}
+
+// healthyDeployment returns a Deployment whose status reports a fully landed
+// rollout, so isRolloutComplete passes for it. All chain fixtures live in ns1.
+func healthyDeployment(name string, anns map[string]string) *appsv1.Deployment {
+	replicas := int32(1)
+	return &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns1", Annotations: anns},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Status:     appsv1.DeploymentStatus{UpdatedReplicas: 1, Replicas: 1, AvailableReplicas: 1},
+	}
+}
+
+func healthyStatefulSet(name string, anns map[string]string) *appsv1.StatefulSet {
+	replicas := int32(1)
+	return &appsv1.StatefulSet{
+		TypeMeta:   metav1.TypeMeta{Kind: "StatefulSet", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns1", Annotations: anns},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+		Status:     appsv1.StatefulSetStatus{UpdatedReplicas: 1, ReadyReplicas: 1, CurrentRevision: "r1", UpdateRevision: "r1"},
+	}
+}
+
+// unhealthyDeployment reports a rollout that never lands (no updated replicas).
+func unhealthyDeployment(name string, anns map[string]string) *appsv1.Deployment {
+	replicas := int32(1)
+	return &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns1", Annotations: anns},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Status:     appsv1.DeploymentStatus{},
+	}
+}
+
+func setDeploymentHealthy(t *testing.T, clientset *fake.Clientset, ns, name string) {
+	t.Helper()
+	dep, err := clientset.AppsV1().Deployments(ns).Get(context.TODO(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	replicas := int32(1)
+	if dep.Spec.Replicas != nil {
+		replicas = *dep.Spec.Replicas
+	}
+	dep.Status = appsv1.DeploymentStatus{
+		ObservedGeneration: dep.Generation,
+		UpdatedReplicas:    replicas,
+		Replicas:           replicas,
+		AvailableReplicas:  replicas,
+	}
+	_, err = clientset.AppsV1().Deployments(ns).UpdateStatus(context.TODO(), dep, metav1.UpdateOptions{})
+	require.NoError(t, err)
+}
+
+func hasRestarted(clientset *fake.Clientset, kind, name string) bool {
+	var anns map[string]string
+	switch kind {
+	case "Deployment":
+		obj, err := clientset.AppsV1().Deployments("ns1").Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		anns = obj.Spec.Template.Annotations
+	case "StatefulSet":
+		obj, err := clientset.AppsV1().StatefulSets("ns1").Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		anns = obj.Spec.Template.Annotations
+	}
+	_, ok := anns[CRON_LAST_RESTARTED_AT_KEY]
+	return ok
+}
+
+func edgeFor(s *Scheduler, predRi, followerRi resourceIdentifier) *chainEdge {
+	raw, ok := s.chainMap.Load(predRi)
+	if !ok {
+		return nil
+	}
+	entry := raw.(*chainMapEntry)
+	entry.RLock()
+	defer entry.RUnlock()
+	return entry.edges[followerRi]
+}
+
+func TestReconcileChainEdges(t *testing.T) {
+	t.Parallel()
+
+	newHeadMid := func() (*appsv1.Deployment, *appsv1.StatefulSet) {
+		return healthyDeployment("chain-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"}),
+			healthyStatefulSet("chain-mid", map[string]string{RESTART_AFTER_KEY: "deployment/chain-head"})
+	}
+
+	t.Run("registers edge for pure follower", func(t *testing.T) {
+		head, mid := newHeadMid()
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		edge := edgeFor(s, riOf(head), riOf(mid))
+		require.NotNil(t, edge, "expected chain edge deployment/head -> statefulset/mid")
+		require.Equal(t, chainModeHealth, edge.mode)
+		require.Zero(t, edge.wait)
+
+		raw, loaded := s.resourceMap.Load(riOf(mid))
+		require.True(t, loaded, "pure follower should be tracked")
+		entry := raw.(*resourceMapEntry)
+		require.Empty(t, entry.jobs, "pure follower must not get cron jobs")
+	})
+
+	t.Run("stale edge removed when annotation removed", func(t *testing.T) {
+		head, mid := newHeadMid()
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+
+		delete(mid.Annotations, RESTART_AFTER_KEY)
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		require.Nil(t, edgeFor(s, riOf(head), riOf(mid)), "edge must be removed when annotation is gone")
+		_, loaded := s.resourceMap.Load(riOf(mid))
+		require.False(t, loaded, "unannotated follower must be untracked entirely")
+	})
+
+	t.Run("delete removes predecessor entry and follower edges", func(t *testing.T) {
+		head, mid := newHeadMid()
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		require.NoError(t, s.deleteJobsForResource(mid))
+		require.Nil(t, edgeFor(s, riOf(head), riOf(mid)), "follower delete must drop the edge")
+
+		require.NoError(t, s.reconcileJobsForResource(mid))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+		require.NoError(t, s.deleteJobsForResource(head))
+		_, loaded := s.chainMap.Load(riOf(head))
+		require.False(t, loaded, "predecessor delete must drop its whole chain entry")
+	})
+}
+
+func TestReconcileChainEdgeValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		testName string
+		anns     map[string]string
+		wantEdge bool
+		wantMode chainMode
+		wantWait time.Duration
+	}{
+		{
+			testName: "default mode health",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head"},
+			wantEdge: true, wantMode: chainModeHealth,
+		},
+		{
+			testName: "explicit health",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH},
+			wantEdge: true, wantMode: chainModeHealth,
+		},
+		{
+			testName: "health-plus-wait with wait",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT, RESTART_AFTER_WAIT_KEY: "30s"},
+			wantEdge: true, wantMode: chainModeHealthPlusWait, wantWait: 30 * time.Second,
+		},
+		{
+			testName: "invalid mode",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_MODE_KEY: "eventually"},
+		},
+		{
+			testName: "wait without health-plus-wait",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_WAIT_KEY: "30s"},
+		},
+		{
+			testName: "health-plus-wait without wait",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT},
+		},
+		{
+			testName: "unparsable wait",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT, RESTART_AFTER_WAIT_KEY: "banana"},
+		},
+		{
+			testName: "non-positive wait",
+			anns:     map[string]string{RESTART_AFTER_KEY: "deployment/head", RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT, RESTART_AFTER_WAIT_KEY: "-5m"},
+		},
+		{
+			testName: "invalid predecessor ref",
+			anns:     map[string]string{RESTART_AFTER_KEY: "pod/head"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			head := healthyDeployment("head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+			follower := healthyDeployment("follower", tt.anns)
+
+			s, _ := newTestSchedulerWithChain(t, time.Minute, head, follower)
+			s.cron.StartAsync()
+			defer s.cron.Stop()
+
+			require.NoError(t, s.reconcileJobsForResource(head))
+			require.NoError(t, s.reconcileJobsForResource(follower))
+
+			edge := edgeFor(s, riOf(head), riOf(follower))
+			if !tt.wantEdge {
+				require.Nil(t, edge, "invalid configuration must not register an edge")
+				return
+			}
+			require.NotNil(t, edge)
+			require.Equal(t, tt.wantMode, edge.mode)
+			require.Equal(t, tt.wantWait, edge.wait)
+		})
+	}
+}
+
+func TestChainCycleDetection(t *testing.T) {
+	t.Parallel()
+
+	t.Run("self-reference rejected", func(t *testing.T) {
+		dep := healthyDeployment("loop", map[string]string{
+			CRON_PATTERN_KEY:  "* * * * *",
+			RESTART_AFTER_KEY: "deployment/loop",
+		})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, dep)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(dep))
+		require.Nil(t, edgeFor(s, riOf(dep), riOf(dep)))
+	})
+
+	t.Run("two-node cycle rejected", func(t *testing.T) {
+		a := healthyDeployment("a", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		b := healthyStatefulSet("b", map[string]string{RESTART_AFTER_KEY: "deployment/a"})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, a, b)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(a))
+		require.NoError(t, s.reconcileJobsForResource(b))
+		require.NotNil(t, edgeFor(s, riOf(a), riOf(b)))
+
+		// now make a follow b: a->b->a would close the cycle and must be skipped
+		a.Annotations[RESTART_AFTER_KEY] = "statefulset/b"
+		require.NoError(t, s.reconcileJobsForResource(a))
+		require.Nil(t, edgeFor(s, riOf(b), riOf(a)), "cycle-creating edge must be rejected")
+	})
+
+	t.Run("diamond allowed", func(t *testing.T) {
+		a := healthyDeployment("d-a", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		b := healthyStatefulSet("d-b", map[string]string{RESTART_AFTER_KEY: "deployment/d-a"})
+		c := healthyDeployment("d-c", map[string]string{RESTART_AFTER_KEY: "deployment/d-a"})
+		d := healthyDeployment("d-d", map[string]string{RESTART_AFTER_KEY: "statefulset/d-b,deployment/d-c"})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, a, b, c, d)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		for _, obj := range []runtime.Object{a, b, c, d} {
+			require.NoError(t, s.reconcileJobsForResource(obj))
+		}
+		require.NotNil(t, edgeFor(s, riOf(b), riOf(d)))
+		require.NotNil(t, edgeFor(s, riOf(c), riOf(d)))
+	})
+}
+
+func TestIsRolloutComplete(t *testing.T) {
+	t.Parallel()
+
+	replicas := func(n int32) *int32 { return &n }
+
+	tests := []struct {
+		testName string
+		obj      runtime.Object
+		expected bool
+	}{
+		{
+			testName: "deployment healthy",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: replicas(2)},
+				Status: appsv1.DeploymentStatus{UpdatedReplicas: 2, Replicas: 2, AvailableReplicas: 2},
+			},
+			expected: true,
+		},
+		{
+			testName: "deployment paused",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: replicas(1), Paused: true},
+				Status: appsv1.DeploymentStatus{UpdatedReplicas: 1, Replicas: 1, AvailableReplicas: 1},
+			},
+			expected: false,
+		},
+		{
+			testName: "deployment observedGeneration lag",
+			obj: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
+				Spec:       appsv1.DeploymentSpec{Replicas: replicas(1)},
+				Status:     appsv1.DeploymentStatus{ObservedGeneration: 2, UpdatedReplicas: 1, Replicas: 1, AvailableReplicas: 1},
+			},
+			expected: false,
+		},
+		{
+			testName: "deployment scaled to zero",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: replicas(0)},
+				Status: appsv1.DeploymentStatus{},
+			},
+			expected: true,
+		},
+		{
+			testName: "deployment not fully updated",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: replicas(2)},
+				Status: appsv1.DeploymentStatus{UpdatedReplicas: 1, Replicas: 2, AvailableReplicas: 2},
+			},
+			expected: false,
+		},
+		{
+			testName: "deployment old pods still terminating",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: replicas(1)},
+				Status: appsv1.DeploymentStatus{UpdatedReplicas: 1, Replicas: 2, AvailableReplicas: 1},
+			},
+			expected: false,
+		},
+		{
+			testName: "deployment available below updated",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{Replicas: replicas(2)},
+				Status: appsv1.DeploymentStatus{UpdatedReplicas: 2, Replicas: 2, AvailableReplicas: 1},
+			},
+			expected: false,
+		},
+		{
+			testName: "deployment default replicas healthy",
+			obj: &appsv1.Deployment{
+				Spec:   appsv1.DeploymentSpec{},
+				Status: appsv1.DeploymentStatus{UpdatedReplicas: 1, Replicas: 1, AvailableReplicas: 1},
+			},
+			expected: true,
+		},
+		{
+			testName: "statefulset healthy",
+			obj: &appsv1.StatefulSet{
+				Spec:   appsv1.StatefulSetSpec{Replicas: replicas(2)},
+				Status: appsv1.StatefulSetStatus{UpdatedReplicas: 2, ReadyReplicas: 2, CurrentRevision: "r2", UpdateRevision: "r2"},
+			},
+			expected: true,
+		},
+		{
+			testName: "statefulset revision rollout pending",
+			obj: &appsv1.StatefulSet{
+				Spec:   appsv1.StatefulSetSpec{Replicas: replicas(1)},
+				Status: appsv1.StatefulSetStatus{UpdatedReplicas: 1, ReadyReplicas: 1, CurrentRevision: "r1", UpdateRevision: "r2"},
+			},
+			expected: false,
+		},
+		{
+			testName: "statefulset not ready",
+			obj: &appsv1.StatefulSet{
+				Spec:   appsv1.StatefulSetSpec{Replicas: replicas(2)},
+				Status: appsv1.StatefulSetStatus{UpdatedReplicas: 2, ReadyReplicas: 1, CurrentRevision: "r1", UpdateRevision: "r1"},
+			},
+			expected: false,
+		},
+		{
+			testName: "statefulset scaled to zero",
+			obj: &appsv1.StatefulSet{
+				Spec:   appsv1.StatefulSetSpec{Replicas: replicas(0)},
+				Status: appsv1.StatefulSetStatus{},
+			},
+			expected: true,
+		},
+		{
+			testName: "daemonset healthy",
+			obj: &appsv1.DaemonSet{
+				Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 3, NumberReady: 3},
+			},
+			expected: true,
+		},
+		{
+			testName: "daemonset no nodes",
+			obj: &appsv1.DaemonSet{
+				Status: appsv1.DaemonSetStatus{},
+			},
+			expected: true,
+		},
+		{
+			testName: "daemonset not fully updated",
+			obj: &appsv1.DaemonSet{
+				Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, UpdatedNumberScheduled: 2, NumberReady: 3},
+			},
+			expected: false,
+		},
+		{
+			testName: "daemonset not ready",
+			obj: &appsv1.DaemonSet{
+				Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 2, UpdatedNumberScheduled: 2, NumberReady: 1},
+			},
+			expected: false,
+		},
+		{
+			testName: "unsupported type",
+			obj:      &appsv1.ReplicaSet{},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testName, func(t *testing.T) {
+			require.Equal(t, tt.expected, isRolloutComplete(tt.obj))
+		})
+	}
+}
+
+func TestChainHealthEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	head := healthyDeployment("e2e-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("e2e-mid", map[string]string{RESTART_AFTER_KEY: "deployment/e2e-head"})
+	tail := healthyDeployment("e2e-tail", map[string]string{RESTART_AFTER_KEY: "statefulset/e2e-mid"})
+
+	s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid, tail)
+	metrics := NewKairosMetrics()
+	s.metrics = metrics
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	for _, obj := range []runtime.Object{head, mid, tail} {
+		s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj})
+	}
+
+	s.cron.RunAll()
+
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "e2e-head") }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "StatefulSet", "e2e-mid") }, 5*time.Second, 10*time.Millisecond, "expected mid to restart after head")
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "e2e-tail") }, 5*time.Second, 10*time.Millisecond, "expected tail to restart after mid (X->Y->Z)")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.ChainStepsTotal.WithLabelValues("StatefulSet", "ns1", "e2e-mid", CHAIN_OUTCOME_COMPLETED)))
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.ChainStepsTotal.WithLabelValues("Deployment", "ns1", "e2e-tail", CHAIN_OUTCOME_COMPLETED)))
+}
+
+func TestChainWaitsForPredecessorHealth(t *testing.T) {
+	t.Parallel()
+
+	head := unhealthyDeployment("gate-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("gate-mid", map[string]string{RESTART_AFTER_KEY: "deployment/gate-head"})
+
+	s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: head})
+	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: mid})
+	s.cron.RunAll()
+
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "gate-head") }, 5*time.Second, 10*time.Millisecond)
+
+	// while the predecessor's rollout has not landed, the follower must wait
+	time.Sleep(300 * time.Millisecond)
+	require.False(t, hasRestarted(clientset, "StatefulSet", "gate-mid"), "follower must not restart while predecessor is unhealthy")
+
+	setDeploymentHealthy(t, clientset, "ns1", "gate-head")
+
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "StatefulSet", "gate-mid") }, 5*time.Second, 10*time.Millisecond, "follower must restart once predecessor is healthy")
+}
+
+func TestChainHealthPlusWaitTiming(t *testing.T) {
+	t.Parallel()
+
+	head := healthyDeployment("wait-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	follower := healthyDeployment("wait-follower", map[string]string{
+		RESTART_AFTER_KEY:      "deployment/wait-head",
+		RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT,
+		RESTART_AFTER_WAIT_KEY: "250ms",
+	})
+
+	s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: head})
+	s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: follower})
+	s.cron.RunAll()
+
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "wait-head") }, 5*time.Second, 5*time.Millisecond)
+	headAt := time.Now()
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "Deployment", "wait-follower") }, 5*time.Second, 5*time.Millisecond)
+
+	gap := time.Since(headAt)
+	require.GreaterOrEqual(t, gap, 180*time.Millisecond, "follower must wait out the post-health settle delay")
+	require.Less(t, gap, 3*time.Second, "follower fired implausibly late after the settle delay")
+}
+
+func TestChainTimeoutAbortsCascade(t *testing.T) {
+	t.Parallel()
+
+	head := unhealthyDeployment("to-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("to-mid", map[string]string{RESTART_AFTER_KEY: "deployment/to-head"})
+	blocked := healthyDeployment("to-blocked", map[string]string{RESTART_AFTER_KEY: "statefulset/to-mid"})
+
+	s, clientset := newTestSchedulerWithChain(t, 300*time.Millisecond, head, mid, blocked)
+	metrics := NewKairosMetrics()
+	s.metrics = metrics
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	for _, obj := range []runtime.Object{head, mid, blocked} {
+		s.processSchedulerBundle(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj})
+	}
+	s.cron.RunAll()
+
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(metrics.ChainStepsTotal.WithLabelValues("StatefulSet", "ns1", "to-mid", CHAIN_OUTCOME_TIMEOUT)) == 1
+	}, 5*time.Second, 10*time.Millisecond, "expected a timeout outcome for the direct follower")
+
+	time.Sleep(300 * time.Millisecond)
+	require.False(t, hasRestarted(clientset, "StatefulSet", "to-mid"), "timed-out follower must not restart onto an unhealthy predecessor")
+	require.False(t, hasRestarted(clientset, "Deployment", "to-blocked"), "cascade must not propagate past the timed-out step")
+	require.Zero(t, testutil.ToFloat64(metrics.ChainStepsTotal.WithLabelValues("Deployment", "ns1", "to-blocked", CHAIN_OUTCOME_TIMEOUT)))
+}
+
+func TestPendingStepDedupe(t *testing.T) {
+	t.Parallel()
+
+	head := unhealthyDeployment("dedupe-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("dedupe-mid", map[string]string{RESTART_AFTER_KEY: "deployment/dedupe-head"})
+
+	s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	require.NoError(t, s.reconcileJobsForResource(head))
+	require.NoError(t, s.reconcileJobsForResource(mid))
+
+	// two triggers while the first step is still waiting on health must dedupe to one
+	s.triggerFollowers(riOf(head))
+	s.triggerFollowers(riOf(head))
+
+	pending := 0
+	s.pendingSteps.Range(func(_, _ any) bool { pending++; return true })
+	require.Equal(t, 1, pending, "expected exactly one in-flight step for the follower")
+
+	setDeploymentHealthy(t, clientset, "ns1", "dedupe-head")
+	require.Eventually(t, func() bool { return hasRestarted(clientset, "StatefulSet", "dedupe-mid") }, 5*time.Second, 10*time.Millisecond)
+
+	time.Sleep(200 * time.Millisecond)
+	patches := 0
+	for _, action := range clientset.Actions() {
+		if action.GetVerb() == "patch" && action.GetResource().Resource == "statefulsets" {
+			patches++
+		}
+	}
+	require.Equal(t, 1, patches, "deduped triggers must produce exactly one follower restart")
+}
+
+func TestJobStatusJSONChainedEntries(t *testing.T) {
+	t.Parallel()
+
+	head := healthyDeployment("js-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("js-mid", map[string]string{RESTART_AFTER_KEY: "deployment/js-head"})
+	tail := healthyDeployment("js-tail", map[string]string{
+		CRON_PATTERN_KEY:       "0 0 * * *",
+		RESTART_AFTER_KEY:      "statefulset/js-mid",
+		RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT,
+		RESTART_AFTER_WAIT_KEY: "30s",
+	})
+
+	s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid, tail)
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	for _, obj := range []runtime.Object{head, mid, tail} {
+		require.NoError(t, s.reconcileJobsForResource(obj))
+	}
+
+	rec := httptest.NewRecorder()
+	s.JobStatusJSON(rec, httptest.NewRequest("GET", "/api/jobs", nil))
+
+	var entries []jobStatusEntry
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &entries))
+
+	byName := map[string][]jobStatusEntry{}
+	for _, e := range entries {
+		byName[e.Resource] = append(byName[e.Resource], e)
+	}
+
+	midEntries := byName[string(riOf(mid))]
+	require.Len(t, midEntries, 1, "pure follower must appear exactly once")
+	require.Equal(t, "", midEntries[0].CronPattern, "chained entry has no cron pattern")
+	require.Equal(t, "deployment/js-head", midEntries[0].RestartAfter)
+	require.Equal(t, CHAIN_MODE_DISPLAY_HEALTH, midEntries[0].RestartAfterMode)
+
+	tailEntries := byName[string(riOf(tail))]
+	require.Len(t, tailEntries, 1, "follower with its own cron job appears as its cron entry, not additionally chained")
+	require.Equal(t, cronPattern("0 0 * * *").String(), tailEntries[0].CronPattern)
+	require.Equal(t, "statefulset/js-mid", tailEntries[0].RestartAfter)
+	require.Equal(t, CHAIN_MODE_DISPLAY_PLUS_WAIT, tailEntries[0].RestartAfterMode)
+	require.Equal(t, "30s", tailEntries[0].RestartAfterWait)
+
+	headEntries := byName[string(riOf(head))]
+	require.Len(t, headEntries, 1)
+	require.Empty(t, headEntries[0].RestartAfter)
 }
