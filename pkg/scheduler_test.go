@@ -279,6 +279,90 @@ func TestReconcileJobsPatternChange(t *testing.T) {
 	require.False(t, has306, "expected pattern '30 6 * * *' to be removed")
 }
 
+// TestReconcileJobsContinuesPastBadPattern covers that a permanently-invalid cron
+// pattern does not stop the rest of the reconcile. The workqueue drops the key
+// after five retries, so anything skipped here would never happen at all.
+func TestReconcileJobsContinuesPastBadPattern(t *testing.T) {
+	t.Parallel()
+
+	t.Run("bad pattern does not block chain edges on the same object", func(t *testing.T) {
+		head := healthyDeployment("bad-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("bad-mid", map[string]string{
+			CRON_PATTERN_KEY:  "not a cron",
+			RESTART_AFTER_KEY: "deployment/bad-head",
+		})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+
+		err := s.reconcileJobsForResource(mid)
+		require.Error(t, err, "the invalid pattern must still be reported")
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"a valid restart-after must be registered even when cron-pattern is invalid")
+	})
+
+	t.Run("bad pattern does not block deletion of a removed pattern", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "bad-delete",
+				Namespace:   "ns1",
+				Annotations: map[string]string{CRON_PATTERN_KEY: "30 6 * * *"},
+			},
+		}
+		s, _ := newTestScheduler(t, dep)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(dep))
+		ri := riOf(dep)
+		raw, _ := s.resourceMap.Load(ri)
+		require.Len(t, raw.(*resourceMapEntry).jobs, 1)
+
+		// swap the old pattern for an invalid one: the old job must still go away,
+		// otherwise the workload keeps restarting on a schedule the user deleted
+		dep.Annotations[CRON_PATTERN_KEY] = "garbage"
+		require.Error(t, s.reconcileJobsForResource(dep))
+
+		raw, _ = s.resourceMap.Load(ri)
+		entry := raw.(*resourceMapEntry)
+		entry.RLock()
+		defer entry.RUnlock()
+		require.NotContains(t, entry.jobs, cronPattern("30 6 * * *"),
+			"removed pattern must be deleted even though the new one is invalid")
+		require.Empty(t, entry.jobs)
+	})
+
+	t.Run("valid patterns are added alongside an invalid one", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bad-mixed",
+				Namespace: "ns1",
+				// the invalid pattern sorts first so it is hit before the valid ones
+				Annotations: map[string]string{CRON_PATTERN_KEY: "garbage;0 0 * * *;15 18 * * *"},
+			},
+		}
+		s, _ := newTestScheduler(t, dep)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		err := s.reconcileJobsForResource(dep)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "garbage")
+
+		raw, _ := s.resourceMap.Load(riOf(dep))
+		entry := raw.(*resourceMapEntry)
+		entry.RLock()
+		defer entry.RUnlock()
+		require.Contains(t, entry.jobs, cronPattern("0 0 * * *"))
+		require.Contains(t, entry.jobs, cronPattern("15 18 * * *"))
+		require.Len(t, entry.jobs, 2)
+	})
+}
+
 func TestReconcileJobsAnnotationRemoved(t *testing.T) {
 	t.Parallel()
 
@@ -1149,7 +1233,7 @@ func TestReconcileChainEdges(t *testing.T) {
 		require.False(t, loaded, "unannotated follower must be untracked entirely")
 	})
 
-	t.Run("delete removes predecessor entry and follower edges", func(t *testing.T) {
+	t.Run("follower delete removes its edges, predecessor delete does not", func(t *testing.T) {
 		head, mid := newHeadMid()
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
 		s.cron.StartAsync()
@@ -1163,9 +1247,104 @@ func TestReconcileChainEdges(t *testing.T) {
 
 		require.NoError(t, s.reconcileJobsForResource(mid))
 		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+
+		// the edge belongs to the follower that declared restart-after, so deleting
+		// the predecessor must leave it in place; it is inert while head cannot fire
 		require.NoError(t, s.deleteJobsForResource(head))
-		_, loaded := s.chainMap.Load(riOf(head))
-		require.False(t, loaded, "predecessor delete must drop its whole chain entry")
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"predecessor delete must not orphan the follower's edge")
+	})
+}
+
+// TestChainEdgeSurvivesPredecessorChurn covers the ways synchronize routes a
+// predecessor through deleteJobsForResource without the follower ever changing:
+// losing its annotations, and being deleted and recreated. In every case the
+// follower's edge must still be there once the predecessor can fire again,
+// because only the follower's own reconcile ever registers it.
+func TestChainEdgeSurvivesPredecessorChurn(t *testing.T) {
+	t.Parallel()
+
+	t.Run("predecessor loses and regains cron-pattern", func(t *testing.T) {
+		head := healthyDeployment("churn-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("churn-mid", map[string]string{RESTART_AFTER_KEY: "deployment/churn-head"})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+
+		// operator removes the cron-pattern; synchronize turns this into a delete
+		delete(head.Annotations, CRON_PATTERN_KEY)
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"edge must survive the predecessor being unannotated")
+
+		// ...and puts it back
+		head.Annotations[CRON_PATTERN_KEY] = "* * * * *"
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"edge must still be registered once the predecessor can fire again")
+	})
+
+	t.Run("predecessor deleted and recreated", func(t *testing.T) {
+		head := healthyDeployment("recreate-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("recreate-mid", map[string]string{RESTART_AFTER_KEY: "deployment/recreate-head"})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		require.NoError(t, s.deleteJobsForResource(head))
+		recreated := healthyDeployment("recreate-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		require.NoError(t, s.reconcileJobsForResource(recreated))
+
+		require.NotNil(t, edgeFor(s, riOf(recreated), riOf(mid)),
+			"edge must survive a delete/recreate of the predecessor")
+	})
+
+	t.Run("predecessor that is not itself annotated", func(t *testing.T) {
+		// a follower may name a predecessor carrying no kairos annotations at all;
+		// every informer update for it arrives here as a delete
+		mid := healthyStatefulSet("bare-mid", map[string]string{RESTART_AFTER_KEY: "deployment/bare-head"})
+		bare := healthyDeployment("bare-head", nil)
+		s, _ := newTestSchedulerWithChain(t, time.Minute, bare, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(mid))
+		require.NotNil(t, edgeFor(s, riOf(bare), riOf(mid)))
+
+		require.NoError(t, s.deleteJobsForResource(bare))
+		require.NotNil(t, edgeFor(s, riOf(bare), riOf(mid)),
+			"an unannotated predecessor's sync must not wipe the follower's edge")
+	})
+
+	t.Run("edge still fires after predecessor churn", func(t *testing.T) {
+		head := healthyDeployment("fire-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("fire-mid", map[string]string{RESTART_AFTER_KEY: "deployment/fire-head"})
+		s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		delete(head.Annotations, CRON_PATTERN_KEY)
+		require.NoError(t, s.reconcileJobsForResource(head))
+		head.Annotations[CRON_PATTERN_KEY] = "* * * * *"
+		require.NoError(t, s.reconcileJobsForResource(head))
+
+		// head restarting must still cascade to mid
+		s.fireRestart(head)
+		require.Eventually(t, func() bool {
+			sts, err := clientset.AppsV1().StatefulSets("ns1").Get(context.TODO(), "fire-mid", metav1.GetOptions{})
+			require.NoError(t, err)
+			return sts.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] != ""
+		}, 5*time.Second, 10*time.Millisecond, "follower was never restarted after predecessor churn")
 	})
 }
 

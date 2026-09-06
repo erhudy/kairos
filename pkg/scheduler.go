@@ -324,14 +324,25 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		s.logger.Debug("patterns that did not change", zap.Stringers("patterns", patternsThatDidNotChange))
 	}
 
+	// every phase runs even if an earlier one failed: a permanently bad pattern
+	// (e.g. an unparseable cron expression) must not stop the other patterns from
+	// being added, stale jobs from being deleted, or chain edges from being
+	// registered, since the workqueue eventually drops the key and the skipped
+	// work would never happen
+	var errs []error
+
+	addedPatterns := []cronPattern{}
 	for _, p := range patternsToAdd {
 		err := s.createJob(p, ri, obj)
 		if err != nil {
-			return fmt.Errorf("error while adding job during reconcile: %w", err)
+			errs = append(errs, fmt.Errorf("error while adding job %s during reconcile: %w", p, err))
+			continue
 		}
+		addedPatterns = append(addedPatterns, p)
 	}
-	if len(patternsToAdd) > 0 {
-		s.checkMissedRestart(patternsToAdd, obj)
+	// only patterns that actually got a job can have a catch-up restart
+	if len(addedPatterns) > 0 {
+		s.checkMissedRestart(addedPatterns, obj)
 	}
 	for _, p := range patternsToDelete {
 		entry.RLock()
@@ -339,13 +350,13 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		entry.RUnlock()
 		err := s.deleteJob(p, ri, job, obj)
 		if err != nil {
-			return fmt.Errorf("error while deleting job during reconcile: %w", err)
+			errs = append(errs, fmt.Errorf("error while deleting job %s during reconcile: %w", p, err))
 		}
 	}
 
 	s.reconcileChainEdges(obj)
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // getOrCreateEntry returns the resource map entry for ri, creating and storing
@@ -488,8 +499,16 @@ func (s *Scheduler) deleteJobsForResource(obj runtime.Object) error {
 	ri := getResourceIdentifier(objm, objk)
 
 	// a resource that is gone or no longer annotated must not remain in the chain
-	// graph: neither as a firing source for others nor as a follower awaiting one
-	s.chainMap.Delete(ri)
+	// graph as a follower awaiting someone else's restart.
+	//
+	// its entry as a *predecessor* (chainMap[ri]) is deliberately left alone: those
+	// edges are owned by the followers that declared restart-after, not by this
+	// resource, and only a follower's own reconcile re-registers them. Dropping them
+	// here would silently orphan every follower until it happened to be touched
+	// again -- and synchronize routes any object without kairos annotations through
+	// this path, so that includes a predecessor merely losing its cron-pattern or
+	// being recreated by a redeploy. The edges are inert while the predecessor
+	// cannot fire, and runChainStep aborts on a predecessor that no longer exists.
 	s.removeChainEdgesForFollower(ri)
 
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
