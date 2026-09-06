@@ -384,3 +384,29 @@ spec:
         - name: erhudy-test
           image: alpine:latest
           command: ["sleep", "infinity"]
+---
+# A pure follower whose cron-pattern is invalid. The bad pattern must not stop
+# the reconcile from registering its valid restart-after edge (refs #40), so it
+# still appears on /api/jobs as a chained entry and still cascades from head.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erhudy-test-chain-badcron
+  namespace: namespace-1
+  annotations:
+    kairos.erhudy.com/cron-pattern: "this is not a cron pattern"
+    kairos.erhudy.com/restart-after: deployment/erhudy-test-chain-head
+spec:
+  selector:
+    matchLabels:
+      app: erhudy-test-chain-badcron
+  template:
+    metadata:
+      labels:
+        app: erhudy-test-chain-badcron
+    spec:
+      terminationGracePeriodSeconds: 0
+      containers:
+        - name: erhudy-test
+          image: alpine:latest
+          command: ["sleep", "infinity"]

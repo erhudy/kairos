@@ -279,6 +279,90 @@ func TestReconcileJobsPatternChange(t *testing.T) {
 	require.False(t, has306, "expected pattern '30 6 * * *' to be removed")
 }
 
+// TestReconcileJobsContinuesPastBadPattern covers that a permanently-invalid cron
+// pattern does not stop the rest of the reconcile. The workqueue drops the key
+// after five retries, so anything skipped here would never happen at all.
+func TestReconcileJobsContinuesPastBadPattern(t *testing.T) {
+	t.Parallel()
+
+	t.Run("bad pattern does not block chain edges on the same object", func(t *testing.T) {
+		head := healthyDeployment("bad-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("bad-mid", map[string]string{
+			CRON_PATTERN_KEY:  "not a cron",
+			RESTART_AFTER_KEY: "deployment/bad-head",
+		})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+
+		err := s.reconcileJobsForResource(mid)
+		require.Error(t, err, "the invalid pattern must still be reported")
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"a valid restart-after must be registered even when cron-pattern is invalid")
+	})
+
+	t.Run("bad pattern does not block deletion of a removed pattern", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "bad-delete",
+				Namespace:   "ns1",
+				Annotations: map[string]string{CRON_PATTERN_KEY: "30 6 * * *"},
+			},
+		}
+		s, _ := newTestScheduler(t, dep)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(dep))
+		ri := riOf(dep)
+		raw, _ := s.resourceMap.Load(ri)
+		require.Len(t, raw.(*resourceMapEntry).jobs, 1)
+
+		// swap the old pattern for an invalid one: the old job must still go away,
+		// otherwise the workload keeps restarting on a schedule the user deleted
+		dep.Annotations[CRON_PATTERN_KEY] = "garbage"
+		require.Error(t, s.reconcileJobsForResource(dep))
+
+		raw, _ = s.resourceMap.Load(ri)
+		entry := raw.(*resourceMapEntry)
+		entry.RLock()
+		defer entry.RUnlock()
+		require.NotContains(t, entry.jobs, cronPattern("30 6 * * *"),
+			"removed pattern must be deleted even though the new one is invalid")
+		require.Empty(t, entry.jobs)
+	})
+
+	t.Run("valid patterns are added alongside an invalid one", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bad-mixed",
+				Namespace: "ns1",
+				// the invalid pattern sorts first so it is hit before the valid ones
+				Annotations: map[string]string{CRON_PATTERN_KEY: "garbage;0 0 * * *;15 18 * * *"},
+			},
+		}
+		s, _ := newTestScheduler(t, dep)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		err := s.reconcileJobsForResource(dep)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "garbage")
+
+		raw, _ := s.resourceMap.Load(riOf(dep))
+		entry := raw.(*resourceMapEntry)
+		entry.RLock()
+		defer entry.RUnlock()
+		require.Contains(t, entry.jobs, cronPattern("0 0 * * *"))
+		require.Contains(t, entry.jobs, cronPattern("15 18 * * *"))
+		require.Len(t, entry.jobs, 2)
+	})
+}
+
 func TestReconcileJobsAnnotationRemoved(t *testing.T) {
 	t.Parallel()
 
@@ -1149,7 +1233,7 @@ func TestReconcileChainEdges(t *testing.T) {
 		require.False(t, loaded, "unannotated follower must be untracked entirely")
 	})
 
-	t.Run("delete removes predecessor entry and follower edges", func(t *testing.T) {
+	t.Run("follower delete removes its edges, predecessor delete does not", func(t *testing.T) {
 		head, mid := newHeadMid()
 		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
 		s.cron.StartAsync()
@@ -1163,9 +1247,104 @@ func TestReconcileChainEdges(t *testing.T) {
 
 		require.NoError(t, s.reconcileJobsForResource(mid))
 		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+
+		// the edge belongs to the follower that declared restart-after, so deleting
+		// the predecessor must leave it in place; it is inert while head cannot fire
 		require.NoError(t, s.deleteJobsForResource(head))
-		_, loaded := s.chainMap.Load(riOf(head))
-		require.False(t, loaded, "predecessor delete must drop its whole chain entry")
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"predecessor delete must not orphan the follower's edge")
+	})
+}
+
+// TestChainEdgeSurvivesPredecessorChurn covers the ways synchronize routes a
+// predecessor through deleteJobsForResource without the follower ever changing:
+// losing its annotations, and being deleted and recreated. In every case the
+// follower's edge must still be there once the predecessor can fire again,
+// because only the follower's own reconcile ever registers it.
+func TestChainEdgeSurvivesPredecessorChurn(t *testing.T) {
+	t.Parallel()
+
+	t.Run("predecessor loses and regains cron-pattern", func(t *testing.T) {
+		head := healthyDeployment("churn-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("churn-mid", map[string]string{RESTART_AFTER_KEY: "deployment/churn-head"})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+
+		// operator removes the cron-pattern; synchronize turns this into a delete
+		delete(head.Annotations, CRON_PATTERN_KEY)
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"edge must survive the predecessor being unannotated")
+
+		// ...and puts it back
+		head.Annotations[CRON_PATTERN_KEY] = "* * * * *"
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
+			"edge must still be registered once the predecessor can fire again")
+	})
+
+	t.Run("predecessor deleted and recreated", func(t *testing.T) {
+		head := healthyDeployment("recreate-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("recreate-mid", map[string]string{RESTART_AFTER_KEY: "deployment/recreate-head"})
+		s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		require.NoError(t, s.deleteJobsForResource(head))
+		recreated := healthyDeployment("recreate-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		require.NoError(t, s.reconcileJobsForResource(recreated))
+
+		require.NotNil(t, edgeFor(s, riOf(recreated), riOf(mid)),
+			"edge must survive a delete/recreate of the predecessor")
+	})
+
+	t.Run("predecessor that is not itself annotated", func(t *testing.T) {
+		// a follower may name a predecessor carrying no kairos annotations at all;
+		// every informer update for it arrives here as a delete
+		mid := healthyStatefulSet("bare-mid", map[string]string{RESTART_AFTER_KEY: "deployment/bare-head"})
+		bare := healthyDeployment("bare-head", nil)
+		s, _ := newTestSchedulerWithChain(t, time.Minute, bare, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(mid))
+		require.NotNil(t, edgeFor(s, riOf(bare), riOf(mid)))
+
+		require.NoError(t, s.deleteJobsForResource(bare))
+		require.NotNil(t, edgeFor(s, riOf(bare), riOf(mid)),
+			"an unannotated predecessor's sync must not wipe the follower's edge")
+	})
+
+	t.Run("edge still fires after predecessor churn", func(t *testing.T) {
+		head := healthyDeployment("fire-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		mid := healthyStatefulSet("fire-mid", map[string]string{RESTART_AFTER_KEY: "deployment/fire-head"})
+		s, clientset := newTestSchedulerWithChain(t, 5*time.Second, head, mid)
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(mid))
+
+		delete(head.Annotations, CRON_PATTERN_KEY)
+		require.NoError(t, s.reconcileJobsForResource(head))
+		head.Annotations[CRON_PATTERN_KEY] = "* * * * *"
+		require.NoError(t, s.reconcileJobsForResource(head))
+
+		// head restarting must still cascade to mid
+		s.fireRestart(head)
+		require.Eventually(t, func() bool {
+			sts, err := clientset.AppsV1().StatefulSets("ns1").Get(context.TODO(), "fire-mid", metav1.GetOptions{})
+			require.NoError(t, err)
+			return sts.Spec.Template.Annotations[CRON_LAST_RESTARTED_AT_KEY] != ""
+		}, 5*time.Second, 10*time.Millisecond, "follower was never restarted after predecessor churn")
 	})
 }
 
@@ -1631,4 +1810,127 @@ func TestJobStatusJSONChainedEntries(t *testing.T) {
 	headEntries := byName[string(riOf(head))]
 	require.Len(t, headEntries, 1)
 	require.Empty(t, headEntries[0].RestartAfter)
+}
+
+// TestChainSettleWaitAbortIsObserved covers that a cascade dropped during the
+// health-plus-wait settle is logged and counted like every other abort. Before
+// the fix for #41 the settle-wait branch returned bare, so the step vanished
+// with no outcome metric -- exactly the long window where an operator needs to
+// know the follower never fired.
+func TestChainSettleWaitAbortIsObserved(t *testing.T) {
+	t.Parallel()
+
+	newWaitChain := func(t *testing.T, prefix string) (*Scheduler, *fake.Clientset, *KairosMetrics, *appsv1.Deployment, *appsv1.Deployment) {
+		t.Helper()
+		head := healthyDeployment(prefix+"-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		follower := healthyDeployment(prefix+"-follower", map[string]string{
+			RESTART_AFTER_KEY:      "deployment/" + prefix + "-head",
+			RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT,
+			// long enough that the test can interrupt the settle deterministically,
+			// short enough that the edge-removal case is not gated on the full sleep
+			RESTART_AFTER_WAIT_KEY: "1s",
+		})
+		s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
+		metrics := NewKairosMetrics()
+		s.metrics = metrics
+		s.cron.StartAsync()
+		t.Cleanup(s.cron.Stop)
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(follower))
+		return s, clientset, metrics, head, follower
+	}
+
+	abortedCount := func(m *KairosMetrics, name string) float64 {
+		return testutil.ToFloat64(m.ChainStepsTotal.WithLabelValues("Deployment", "ns1", name, CHAIN_OUTCOME_ABORTED))
+	}
+
+	t.Run("edge removed during settle", func(t *testing.T) {
+		s, clientset, metrics, head, follower := newWaitChain(t, "settle-edge")
+		edge := edgeFor(s, riOf(head), riOf(follower))
+		require.NotNil(t, edge)
+
+		go s.runChainStep(riOf(head), edge)
+
+		// let the step clear the health check and enter the settle wait
+		time.Sleep(200 * time.Millisecond)
+		s.removeChainEdgesForFollower(riOf(follower))
+
+		require.Eventually(t, func() bool {
+			return abortedCount(metrics, "settle-edge-follower") == 1
+		}, 10*time.Second, 10*time.Millisecond, "settle-wait abort must record an aborted outcome")
+		require.False(t, hasRestarted(clientset, "Deployment", "settle-edge-follower"),
+			"follower must not restart after its edge was removed mid-settle")
+	})
+
+	t.Run("shutdown during settle", func(t *testing.T) {
+		s, clientset, metrics, head, follower := newWaitChain(t, "settle-shutdown")
+		edge := edgeFor(s, riOf(head), riOf(follower))
+		require.NotNil(t, edge)
+
+		go s.runChainStep(riOf(head), edge)
+
+		time.Sleep(200 * time.Millisecond)
+		s.shutdownCancel()
+
+		require.Eventually(t, func() bool {
+			return abortedCount(metrics, "settle-shutdown-follower") == 1
+		}, 10*time.Second, 10*time.Millisecond, "shutdown during settle must record an aborted outcome")
+		require.False(t, hasRestarted(clientset, "Deployment", "settle-shutdown-follower"),
+			"follower must not restart when the scheduler is shutting down")
+	})
+
+	t.Run("settle that completes still restarts the follower", func(t *testing.T) {
+		// guards against "fixing" the abort path by aborting too eagerly
+		head := healthyDeployment("settle-ok-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		follower := healthyDeployment("settle-ok-follower", map[string]string{
+			RESTART_AFTER_KEY:      "deployment/settle-ok-head",
+			RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT,
+			RESTART_AFTER_WAIT_KEY: "150ms",
+		})
+		s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
+		metrics := NewKairosMetrics()
+		s.metrics = metrics
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(follower))
+
+		s.runChainStep(riOf(head), edgeFor(s, riOf(head), riOf(follower)))
+
+		require.True(t, hasRestarted(clientset, "Deployment", "settle-ok-follower"))
+		require.Equal(t, float64(1), testutil.ToFloat64(
+			metrics.ChainStepsTotal.WithLabelValues("Deployment", "ns1", "settle-ok-follower", CHAIN_OUTCOME_COMPLETED)))
+		require.Zero(t, abortedCount(metrics, "settle-ok-follower"))
+	})
+}
+
+// TestDeleteJobGaugeNotLeakedWhenEntryMissing covers that the scheduled-jobs gauge
+// tracks gocron, not the resource map: the job is gone once RemoveByID returns, so
+// a later map-lookup failure must not strand the count (refs #41).
+func TestDeleteJobGaugeNotLeakedWhenEntryMissing(t *testing.T) {
+	t.Parallel()
+
+	dep := healthyDeployment("gauge-dep", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	s, _ := newTestScheduler(t, dep)
+	metrics := NewKairosMetrics()
+	s.metrics = metrics
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	require.NoError(t, s.reconcileJobsForResource(dep))
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.ScheduledJobs.WithLabelValues("Deployment")))
+
+	cp := cronPattern("* * * * *")
+	ri := riOf(dep)
+	raw, loaded := s.resourceMap.Load(ri)
+	require.True(t, loaded)
+	job := raw.(*resourceMapEntry).jobs[cp]
+
+	// drop the entry so deleteJob's map lookup fails after the job is already gone
+	s.resourceMap.Delete(ri)
+	require.Error(t, s.deleteJob(cp, ri, job, dep))
+	require.Zero(t, testutil.ToFloat64(metrics.ScheduledJobs.WithLabelValues("Deployment")),
+		"gauge must not leak a count when the resource map entry is already gone")
 }

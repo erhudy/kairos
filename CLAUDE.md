@@ -45,9 +45,15 @@ Kubernetes Informer (per resource type)
         → waits for the scheduler's ack; a failed reconcile is returned so the
           workqueue retries it (failed deletes keep the stashed object for retry)
     → Scheduler.run() [pkg/scheduler.go]
-        → reconcileJobsForResource(): add/update/remove gocron jobs
+        → reconcileJobsForResource(): add/update/remove gocron jobs; every phase runs
+          even if an earlier one failed (errors are joined, not returned early), so a
+          bad pattern cannot block other patterns, stale-job deletion, or chain edges
         → reconcileChainEdges(): rebuild this resource's follower edges (validation,
-          cycle detection); stale edges dropped on update/delete
+          cycle detection). An edge is owned by the follower that declared
+          restart-after: only the follower's own reconcile/delete drops it. A
+          predecessor's delete leaves chainMap[pred] intact (the edges are inert while
+          it cannot fire), so churn on the predecessor — losing its cron-pattern, being
+          recreated by a redeploy — does not silently orphan its followers
         → checkMissedRestart(): with -lookback, one catch-up restart per resource
           for firings missed while kairos was not running (gated on scheduler startTime)
         → fireRestart() = restartFunc() + triggerFollowers(): patches PodTemplateSpec

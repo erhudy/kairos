@@ -50,14 +50,14 @@ export KAIROS_BIN="$BIN"
 echo "applying test.yaml"
 kubectl apply -f "$REPO_ROOT/hack/test.yaml" >/dev/null
 
-echo "running integration tests (~20 min)"
+echo "running integration tests (~25 min)"
 # on hosts with aggressive sleep settings (e.g. `pmset -c sleep 1`) boundary windows
 # may still be interrupted; consider `sudo pmset -c sleep 0` for a reliable run.
 cd "$REPO_ROOT"
 # caffeinate (macOS) prevents idle system sleep mid-run; a sleeping machine makes
 # gocron fire overdue jobs in bursts on wake and breaks minute-boundary assertions.
 if command -v caffeinate >/dev/null 2>&1; then
-  caffeinate -dis go test -tags=integration -v -timeout 30m ./test/integration/...
+  caffeinate -dis go test -tags=integration -v -timeout 45m ./test/integration/...
 else
-  go test -tags=integration -v -timeout 30m ./test/integration/...
+  go test -tags=integration -v -timeout 45m ./test/integration/...
 fi

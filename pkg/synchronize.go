@@ -10,6 +10,19 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+// sendToScheduler queues an action for the scheduler. It abandons the send when
+// the controller is shutting down, so a worker cannot block forever on a full
+// workchan after the scheduler goroutine has already stopped consuming it. It
+// reports whether the action was handed over.
+func (c *Controller) sendToScheduler(action ObjectAndSchedulerAction) bool {
+	select {
+	case c.workchan <- action:
+		return true
+	case <-c.stopCh:
+		return false
+	}
+}
+
 // awaitSchedulerAck waits for the scheduler to report the result of an action so
 // failures can be retried via the workqueue. It returns nil if the controller is
 // shutting down before an ack arrives.
@@ -39,7 +52,9 @@ func (c *Controller) synchronize(key string) error {
 		mapObj, ok := c.objectMap.Load(key)
 		if ok {
 			errCh := make(chan error, 1)
-			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: mapObj.(runtime.Object), errCh: errCh}
+			if !c.sendToScheduler(ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: mapObj.(runtime.Object), errCh: errCh}) {
+				return nil
+			}
 			if ackErr := c.awaitSchedulerAck(errCh); ackErr != nil {
 				// keep the stashed object so a retry can re-attempt the delete
 				return fmt.Errorf("error deleting jobs for %s: %w", key, ackErr)
@@ -78,7 +93,9 @@ func (c *Controller) synchronize(key string) error {
 			c.objectMap.Delete(key)
 			c.logger.Debug("don't care about object, cancelling any scheduled restarts", zap.String("namespace", objm.GetNamespace()), zap.String("name", objm.GetName()))
 			errCh := make(chan error, 1)
-			c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: obj.(runtime.Object), errCh: errCh}
+			if !c.sendToScheduler(ObjectAndSchedulerAction{action: RESOURCE_DELETE, obj: obj.(runtime.Object), errCh: errCh}) {
+				return nil
+			}
 			if ackErr := c.awaitSchedulerAck(errCh); ackErr != nil {
 				return fmt.Errorf("error cancelling scheduled restarts for %s: %w", key, ackErr)
 			}
@@ -92,7 +109,9 @@ func (c *Controller) synchronize(key string) error {
 
 		c.logger.Info("observed change for object", zap.String("key", key), zap.String("gvk", objk.GroupVersionKind().String()))
 		errCh := make(chan error, 1)
-		c.workchan <- ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj.(runtime.Object), errCh: errCh}
+		if !c.sendToScheduler(ObjectAndSchedulerAction{action: RESOURCE_CHANGE, obj: obj.(runtime.Object), errCh: errCh}) {
+			return nil
+		}
 		if ackErr := c.awaitSchedulerAck(errCh); ackErr != nil {
 			return fmt.Errorf("error reconciling jobs for %s: %w", key, ackErr)
 		}
