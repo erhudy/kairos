@@ -555,6 +555,20 @@ func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron
 	}
 	// A "not found" result means the desired end state is already reached,
 	// so map/gauge cleanup happens regardless of whether removal succeeded.
+	//
+	// the gauge drops here rather than at the end: the job is gone from gocron by
+	// this point either way, and the map lookup below can fail, which would
+	// otherwise leak a count that never comes back
+	if s.metrics != nil {
+		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Dec()
+	}
+	s.logger.Info(
+		"deleted job",
+		zap.String("resource", string(ri)),
+		zap.String("cron-pattern", string(cp)),
+		zap.Bool("job-not-found", notFound),
+	)
+
 	registeredJobsForResourceRaw, ok := s.resourceMap.Load(ri)
 	if !ok {
 		return fmt.Errorf("resource %s not found in resource map", ri)
@@ -564,15 +578,6 @@ func (s *Scheduler) deleteJob(cp cronPattern, ri resourceIdentifier, job *gocron
 	delete(entry.jobs, cp)
 	delete(entry.lastJitters, cp)
 	entry.Unlock()
-	s.logger.Info(
-		"deleted job",
-		zap.String("resource", string(ri)),
-		zap.String("cron-pattern", string(cp)),
-		zap.Bool("job-not-found", notFound),
-	)
-	if s.metrics != nil {
-		s.metrics.ScheduledJobs.WithLabelValues(kindFromObject(obj)).Dec()
-	}
 	return nil
 }
 
@@ -816,7 +821,8 @@ func (s *Scheduler) runChainStep(predRi resourceIdentifier, edge *chainEdge) {
 		case isRolloutComplete(predObj):
 			s.logger.Info("predecessor healthy again", zap.String("predecessor", string(predRi)))
 			if edge.mode == chainModeHealthPlusWait {
-				if !s.chainSettleWait(edge, predRi) {
+				if reason := s.chainSettleWait(edge, predRi); reason != "" {
+					abort(reason)
 					return
 				}
 			}
@@ -861,15 +867,17 @@ func (s *Scheduler) runChainStep(predRi resourceIdentifier, edge *chainEdge) {
 
 // chainSettleWait sleeps the configured post-health wait for a health-plus-wait
 // edge, re-checking shutdown and edge registration around the sleep like the
-// jitter path does. Returns false if the step should abort.
-func (s *Scheduler) chainSettleWait(edge *chainEdge, predRi resourceIdentifier) bool {
+// jitter path does. It returns "" when the wait completed, or the reason the
+// step should abort -- the caller reports that through abort() so a cascade
+// dropped during a long settle is logged and counted like every other abort.
+func (s *Scheduler) chainSettleWait(edge *chainEdge, predRi resourceIdentifier) string {
 	select {
 	case <-s.shutdownCtx.Done():
-		return false
+		return "shutdown"
 	default:
 	}
 	if !s.edgeStillRegistered(predRi, edge.followerRi) {
-		return false
+		return "edge removed"
 	}
 	s.logger.Info("applying post-health wait before chained restart",
 		zap.String("predecessor", string(predRi)),
@@ -879,9 +887,12 @@ func (s *Scheduler) chainSettleWait(edge *chainEdge, predRi resourceIdentifier) 
 	select {
 	case <-time.After(edge.wait):
 	case <-s.shutdownCtx.Done():
-		return false
+		return "shutdown"
 	}
-	return s.edgeStillRegistered(predRi, edge.followerRi)
+	if !s.edgeStillRegistered(predRi, edge.followerRi) {
+		return "edge removed"
+	}
+	return ""
 }
 
 func (s *Scheduler) getWorkload(ref workloadRef) (runtime.Object, error) {
@@ -1182,10 +1193,6 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 		return false
 	}
 
-	if metrics != nil {
-		metrics.RestartDuration.WithLabelValues(kind, namespace, name).Observe(time.Since(start).Seconds())
-	}
-
 	if err != nil {
 		logger.Error("error patching object in restartFunc", zap.String("type", fmt.Sprintf("%T", incomingObject)), zap.String("namespace", namespace), zap.String("name", name), zap.Error(err))
 		if metrics != nil {
@@ -1195,6 +1202,9 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 	}
 
 	if metrics != nil {
+		// observed only for successful patches: folding failures in would mix
+		// API_CALL_TIMEOUT expiries into what reads as a restart-latency histogram
+		metrics.RestartDuration.WithLabelValues(kind, namespace, name).Observe(time.Since(start).Seconds())
 		metrics.RestartTotal.WithLabelValues(kind, namespace, name).Inc()
 	}
 	return true
@@ -1214,7 +1224,11 @@ func patchPodTemplateAnnotation(ctx context.Context, logger *zap.Logger, clients
 		},
 	})
 	if err != nil {
-		return false, fmt.Errorf("error building patch payload: %w", err)
+		// the payload shape is fixed so this is effectively unreachable, but report
+		// it as a restart failure rather than as an unsupported type: the bool means
+		// "kairos knows how to restart this kind", and the caller drops that branch
+		// without logging or counting it
+		return true, fmt.Errorf("error building patch payload: %w", err)
 	}
 
 	om, _ := getObjectMetaAndKind(obj)

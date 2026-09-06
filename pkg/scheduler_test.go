@@ -1811,3 +1811,126 @@ func TestJobStatusJSONChainedEntries(t *testing.T) {
 	require.Len(t, headEntries, 1)
 	require.Empty(t, headEntries[0].RestartAfter)
 }
+
+// TestChainSettleWaitAbortIsObserved covers that a cascade dropped during the
+// health-plus-wait settle is logged and counted like every other abort. Before
+// the fix for #41 the settle-wait branch returned bare, so the step vanished
+// with no outcome metric -- exactly the long window where an operator needs to
+// know the follower never fired.
+func TestChainSettleWaitAbortIsObserved(t *testing.T) {
+	t.Parallel()
+
+	newWaitChain := func(t *testing.T, prefix string) (*Scheduler, *fake.Clientset, *KairosMetrics, *appsv1.Deployment, *appsv1.Deployment) {
+		t.Helper()
+		head := healthyDeployment(prefix+"-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		follower := healthyDeployment(prefix+"-follower", map[string]string{
+			RESTART_AFTER_KEY:      "deployment/" + prefix + "-head",
+			RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT,
+			// long enough that the test can interrupt the settle deterministically,
+			// short enough that the edge-removal case is not gated on the full sleep
+			RESTART_AFTER_WAIT_KEY: "1s",
+		})
+		s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
+		metrics := NewKairosMetrics()
+		s.metrics = metrics
+		s.cron.StartAsync()
+		t.Cleanup(s.cron.Stop)
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(follower))
+		return s, clientset, metrics, head, follower
+	}
+
+	abortedCount := func(m *KairosMetrics, name string) float64 {
+		return testutil.ToFloat64(m.ChainStepsTotal.WithLabelValues("Deployment", "ns1", name, CHAIN_OUTCOME_ABORTED))
+	}
+
+	t.Run("edge removed during settle", func(t *testing.T) {
+		s, clientset, metrics, head, follower := newWaitChain(t, "settle-edge")
+		edge := edgeFor(s, riOf(head), riOf(follower))
+		require.NotNil(t, edge)
+
+		go s.runChainStep(riOf(head), edge)
+
+		// let the step clear the health check and enter the settle wait
+		time.Sleep(200 * time.Millisecond)
+		s.removeChainEdgesForFollower(riOf(follower))
+
+		require.Eventually(t, func() bool {
+			return abortedCount(metrics, "settle-edge-follower") == 1
+		}, 10*time.Second, 10*time.Millisecond, "settle-wait abort must record an aborted outcome")
+		require.False(t, hasRestarted(clientset, "Deployment", "settle-edge-follower"),
+			"follower must not restart after its edge was removed mid-settle")
+	})
+
+	t.Run("shutdown during settle", func(t *testing.T) {
+		s, clientset, metrics, head, follower := newWaitChain(t, "settle-shutdown")
+		edge := edgeFor(s, riOf(head), riOf(follower))
+		require.NotNil(t, edge)
+
+		go s.runChainStep(riOf(head), edge)
+
+		time.Sleep(200 * time.Millisecond)
+		s.shutdownCancel()
+
+		require.Eventually(t, func() bool {
+			return abortedCount(metrics, "settle-shutdown-follower") == 1
+		}, 10*time.Second, 10*time.Millisecond, "shutdown during settle must record an aborted outcome")
+		require.False(t, hasRestarted(clientset, "Deployment", "settle-shutdown-follower"),
+			"follower must not restart when the scheduler is shutting down")
+	})
+
+	t.Run("settle that completes still restarts the follower", func(t *testing.T) {
+		// guards against "fixing" the abort path by aborting too eagerly
+		head := healthyDeployment("settle-ok-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+		follower := healthyDeployment("settle-ok-follower", map[string]string{
+			RESTART_AFTER_KEY:      "deployment/settle-ok-head",
+			RESTART_AFTER_MODE_KEY: CHAIN_MODE_HEALTH_PLUS_WAIT,
+			RESTART_AFTER_WAIT_KEY: "150ms",
+		})
+		s, clientset := newTestSchedulerWithChain(t, 10*time.Second, head, follower)
+		metrics := NewKairosMetrics()
+		s.metrics = metrics
+		s.cron.StartAsync()
+		defer s.cron.Stop()
+
+		require.NoError(t, s.reconcileJobsForResource(head))
+		require.NoError(t, s.reconcileJobsForResource(follower))
+
+		s.runChainStep(riOf(head), edgeFor(s, riOf(head), riOf(follower)))
+
+		require.True(t, hasRestarted(clientset, "Deployment", "settle-ok-follower"))
+		require.Equal(t, float64(1), testutil.ToFloat64(
+			metrics.ChainStepsTotal.WithLabelValues("Deployment", "ns1", "settle-ok-follower", CHAIN_OUTCOME_COMPLETED)))
+		require.Zero(t, abortedCount(metrics, "settle-ok-follower"))
+	})
+}
+
+// TestDeleteJobGaugeNotLeakedWhenEntryMissing covers that the scheduled-jobs gauge
+// tracks gocron, not the resource map: the job is gone once RemoveByID returns, so
+// a later map-lookup failure must not strand the count (refs #41).
+func TestDeleteJobGaugeNotLeakedWhenEntryMissing(t *testing.T) {
+	t.Parallel()
+
+	dep := healthyDeployment("gauge-dep", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	s, _ := newTestScheduler(t, dep)
+	metrics := NewKairosMetrics()
+	s.metrics = metrics
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	require.NoError(t, s.reconcileJobsForResource(dep))
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.ScheduledJobs.WithLabelValues("Deployment")))
+
+	cp := cronPattern("* * * * *")
+	ri := riOf(dep)
+	raw, loaded := s.resourceMap.Load(ri)
+	require.True(t, loaded)
+	job := raw.(*resourceMapEntry).jobs[cp]
+
+	// drop the entry so deleteJob's map lookup fails after the job is already gone
+	s.resourceMap.Delete(ri)
+	require.Error(t, s.deleteJob(cp, ri, job, dep))
+	require.Zero(t, testutil.ToFloat64(metrics.ScheduledJobs.WithLabelValues("Deployment")),
+		"gauge must not leak a count when the resource map entry is already gone")
+}

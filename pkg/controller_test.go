@@ -384,3 +384,74 @@ type fakeErrorIndexer struct {
 func (f *fakeErrorIndexer) GetByKey(key string) (interface{}, bool, error) {
 	return nil, false, f.err
 }
+
+// TestSendToSchedulerAbandonsOnShutdown covers that a worker does not block
+// forever handing an action to a scheduler that has already stopped consuming
+// the channel. awaitSchedulerAck selected on stopCh but the send did not, so a
+// full workchan at shutdown parked the worker permanently (refs #41).
+func TestSendToSchedulerAbandonsOnShutdown(t *testing.T) {
+	t.Parallel()
+
+	newController := func(workchan chan ObjectAndSchedulerAction, indexer cache.Indexer) *Controller {
+		return NewController(
+			zap.NewNop(),
+			workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+			indexer, nil, "deployments", workchan, nil,
+		)
+	}
+
+	t.Run("send is abandoned once stopCh closes", func(t *testing.T) {
+		// unbuffered with no reader: only the stopCh case can proceed
+		workchan := make(chan ObjectAndSchedulerAction)
+		stopCh := make(chan struct{})
+		c := newController(workchan, cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))
+		c.stopCh = stopCh
+		close(stopCh)
+
+		done := make(chan bool, 1)
+		go func() { done <- c.sendToScheduler(ObjectAndSchedulerAction{action: RESOURCE_CHANGE}) }()
+		select {
+		case sent := <-done:
+			require.False(t, sent, "send must report that it was abandoned")
+		case <-time.After(2 * time.Second):
+			t.Fatal("sendToScheduler blocked after shutdown")
+		}
+	})
+
+	t.Run("synchronize returns instead of blocking at shutdown", func(t *testing.T) {
+		dep := &appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "shutdown-dep",
+				Namespace:   "default",
+				Annotations: map[string]string{CRON_PATTERN_KEY: "0 0 * * *"},
+			},
+		}
+		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+		require.NoError(t, indexer.Add(dep))
+
+		workchan := make(chan ObjectAndSchedulerAction)
+		stopCh := make(chan struct{})
+		c := newController(workchan, indexer)
+		c.stopCh = stopCh
+		close(stopCh)
+
+		done := make(chan error, 1)
+		go func() { done <- c.synchronize("default/shutdown-dep") }()
+		select {
+		case err := <-done:
+			require.NoError(t, err, "an abandoned send at shutdown is not a sync failure")
+		case <-time.After(2 * time.Second):
+			t.Fatal("synchronize blocked on a full workchan after shutdown")
+		}
+	})
+
+	t.Run("nil stopCh still sends", func(t *testing.T) {
+		// controllers built outside Run have no stopCh; the nil case must never
+		// win the select and short-circuit normal operation
+		workchan := make(chan ObjectAndSchedulerAction, 1)
+		c := newController(workchan, cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))
+		require.True(t, c.sendToScheduler(ObjectAndSchedulerAction{action: RESOURCE_CHANGE}))
+		require.Len(t, workchan, 1)
+	})
+}

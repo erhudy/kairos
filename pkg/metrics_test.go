@@ -120,3 +120,62 @@ func TestMetricsRegistration(t *testing.T) {
 	require.True(t, names["kairos_queue_depth"])
 	require.True(t, names["kairos_sync_errors_total"])
 }
+
+// histogramSampleCount returns the total observations across all series of a
+// histogram in reg, or 0 when the family was never gathered.
+func histogramSampleCount(t *testing.T, reg *prometheus.Registry, name string) uint64 {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	var total uint64
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			total += m.GetHistogram().GetSampleCount()
+		}
+	}
+	return total
+}
+
+// TestRestartDurationOnlyObservedOnSuccess covers that the restart-latency
+// histogram is not polluted by failures. It previously observed before checking
+// the error, so every failed patch -- including API_CALL_TIMEOUT expiries, which
+// land at the top of the range -- was folded into what reads as success latency
+// (refs #41).
+func TestRestartDurationOnlyObservedOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	dep := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "duration-dep", Namespace: "ns1"},
+	}
+	logger := zap.NewNop()
+
+	t.Run("failed patch observes nothing", func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		metrics := NewKairosMetrics()
+		metrics.Register(reg)
+
+		// empty clientset: the patch fails with not found
+		require.False(t, restartFunc(context.Background(), logger, fake.NewClientset(), dep, metrics))
+
+		require.Zero(t, histogramSampleCount(t, reg, "kairos_restart_duration_seconds"),
+			"a failed patch must not be recorded as restart latency")
+		require.Equal(t, float64(1),
+			testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "duration-dep", "patch")))
+	})
+
+	t.Run("successful patch observes once", func(t *testing.T) {
+		reg := prometheus.NewRegistry()
+		metrics := NewKairosMetrics()
+		metrics.Register(reg)
+
+		require.True(t, restartFunc(context.Background(), logger, fake.NewClientset(dep), dep, metrics))
+
+		require.Equal(t, uint64(1), histogramSampleCount(t, reg, "kairos_restart_duration_seconds"))
+		require.Equal(t, float64(1),
+			testutil.ToFloat64(metrics.RestartTotal.WithLabelValues("Deployment", "ns1", "duration-dep")))
+	})
+}
