@@ -1,6 +1,6 @@
 # Kairos
 
-Kairos is a small Kubernetes controller that exists solely to restart pods based on a cron pattern annotation applied to the controlling resource (`Deployment`, `DaemonSet` or `StatefulSet`). It exists because of the long and storied tradition of restarting services on a regular basis because it's easier than fixing memory leaks, and who wants to wait around for pods to get OOMKilled?
+Kairos is a small Kubernetes controller that restarts workloads (`Deployment`, `DaemonSet` or `StatefulSet`) on a cron schedule declared by annotation, with optional jitter, catch-up of firings missed while it was down, and ordered chains so dependants roll only after what they depend on is healthy again. It exists because of the long and storied tradition of restarting services on a regular basis because it's easier than fixing memory leaks, and who wants to wait around for pods to get OOMKilled?
 
 ## Using
 
