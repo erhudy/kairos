@@ -234,6 +234,37 @@ func TestReconcileJobsForResource(t *testing.T) {
 	}
 }
 
+func TestReconcileJobsDedupesRepeatedPatterns(t *testing.T) {
+	t.Parallel()
+
+	dep := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dep-dupe",
+			Namespace: "ns1",
+			Annotations: map[string]string{
+				// the same pattern twice, once with surrounding whitespace, plus one distinct one
+				CRON_PATTERN_KEY: "0 0 * * *; 0 0 * * * ;30 6 * * *",
+			},
+		},
+	}
+	s, _ := newTestScheduler(t, dep)
+	s.cron.StartAsync()
+	defer s.cron.Stop()
+
+	// a repeated pattern must not surface as a reconcile error, and must
+	// register exactly one job in both kairos's map and the underlying scheduler
+	require.NoError(t, s.reconcileJobsForResource(dep))
+
+	om, ok := getObjectMetaAndKind(dep)
+	ri := getResourceIdentifier(om, ok)
+	raw, loaded := s.resourceMap.Load(ri)
+	require.True(t, loaded)
+	m := raw.(*resourceMapEntry)
+	require.Len(t, m.jobs, 2)
+	require.Len(t, s.cron.Jobs(), 2, "duplicate pattern must not leak an extra job into the cron scheduler")
+}
+
 func TestReconcileJobsPatternChange(t *testing.T) {
 	t.Parallel()
 

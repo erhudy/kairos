@@ -264,10 +264,17 @@ func (s *Scheduler) reconcileJobsForResource(obj runtime.Object) error {
 		return s.deleteJobsForResource(obj)
 	}
 
+	// deduped in order: a pattern repeated in the annotation must map to one
+	// job, otherwise the second registration either fails (a spurious sync
+	// error) or, without unique-tag enforcement, leaks a job that is never
+	// tracked and so never deleted
 	splitPatternsRaw := strings.Split(strings.TrimSpace(strings.TrimSuffix(string(pattern), ";")), ";")
 	cronPatternsFromResource := []cronPattern{}
 	for _, p := range splitPatternsRaw {
-		cronPatternsFromResource = append(cronPatternsFromResource, cronPattern(strings.TrimSpace(p)))
+		cp := cronPattern(strings.TrimSpace(p))
+		if !slices.Contains(cronPatternsFromResource, cp) {
+			cronPatternsFromResource = append(cronPatternsFromResource, cp)
+		}
 	}
 
 	// build a comparison list against the keys in the resource map for this resource to figure out what to add/delete/ignore
