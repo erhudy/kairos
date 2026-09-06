@@ -12,11 +12,11 @@ rules:
   - daemonsets
   - deployments
   - statefulsets
+  # restarts are JSON merge patches on the pod template; nothing calls update
   verbs:
   - get
   - list
   - patch
-  - update
   - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
