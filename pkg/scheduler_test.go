@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1254,6 +1255,99 @@ func TestReconcileChainEdges(t *testing.T) {
 		require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)),
 			"predecessor delete must not orphan the follower's edge")
 	})
+}
+
+// TestReconcileChainEdgesKeepsUnchangedEdgeVisible is the regression test for
+// the remove-then-readd window: reconcile runs on every informer update for the
+// follower, and triggerFollowers reads the map exactly once at firing time, so
+// an unchanged edge that is briefly absent during reconcile silently drops the
+// cascade. A reader hammers the map while the follower is reconciled in a loop
+// and must never see the edge, or the predecessor's whole entry, go missing.
+func TestReconcileChainEdgesKeepsUnchangedEdgeVisible(t *testing.T) {
+	t.Parallel()
+
+	head := healthyDeployment("chain-head", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("chain-mid", map[string]string{RESTART_AFTER_KEY: "deployment/chain-head"})
+	s, _ := newTestSchedulerWithChain(t, time.Minute, head, mid)
+	require.NoError(t, s.reconcileJobsForResource(head))
+	require.NoError(t, s.reconcileJobsForResource(mid))
+	require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+
+	var checks, edgeMissing, entryMissing atomic.Int64
+	done := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			checks.Add(1)
+			if _, ok := s.chainMap.Load(riOf(head)); !ok {
+				entryMissing.Add(1)
+			}
+			if !s.edgeStillRegistered(riOf(head), riOf(mid)) {
+				edgeMissing.Add(1)
+			}
+		}
+	}()
+
+	for i := 0; i < 10000; i++ {
+		s.reconcileChainEdges(mid)
+	}
+	close(done)
+	<-readerDone
+
+	require.Positive(t, checks.Load(), "reader never ran")
+	require.Zero(t, edgeMissing.Load(), "unchanged edge was observed missing during reconcile")
+	require.Zero(t, entryMissing.Load(), "predecessor chainMap entry was observed missing during reconcile")
+	require.NotNil(t, edgeFor(s, riOf(head), riOf(mid)))
+}
+
+// TestReconcileChainEdgesInPlaceDiff pins the rest of the in-place contract:
+// a reconcile replaces the edge pointer (so in-flight steps keep a consistent
+// snapshot) but keeps the edge for a predecessor that is still listed, prunes
+// only the predecessors that were dropped, and drops everything when the
+// annotation set becomes invalid.
+func TestReconcileChainEdgesInPlaceDiff(t *testing.T) {
+	t.Parallel()
+
+	a := healthyDeployment("chain-a", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	b := healthyDeployment("chain-b", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	c := healthyDeployment("chain-c", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	mid := healthyStatefulSet("chain-mid", map[string]string{RESTART_AFTER_KEY: "deployment/chain-a, deployment/chain-b"})
+	s, _ := newTestSchedulerWithChain(t, time.Minute, a, b, c, mid)
+	for _, o := range []runtime.Object{a, b, c, mid} {
+		require.NoError(t, s.reconcileJobsForResource(o))
+	}
+	before := edgeFor(s, riOf(a), riOf(mid))
+	require.NotNil(t, before)
+	require.NotNil(t, edgeFor(s, riOf(b), riOf(mid)))
+
+	// swap b for c: a's edge stays (new pointer, same key), b's is pruned, c's added
+	mid.Annotations[RESTART_AFTER_KEY] = "deployment/chain-a; deployment/chain-c"
+	mid.Annotations[RESTART_AFTER_MODE_KEY] = CHAIN_MODE_HEALTH_PLUS_WAIT
+	mid.Annotations[RESTART_AFTER_WAIT_KEY] = "30s"
+	require.NoError(t, s.reconcileJobsForResource(mid))
+
+	after := edgeFor(s, riOf(a), riOf(mid))
+	require.NotNil(t, after)
+	require.NotSame(t, before, after, "reconcile must replace the edge pointer, not mutate it in place")
+	require.Equal(t, chainModeHealth, before.mode, "the old snapshot must be untouched")
+	require.Equal(t, chainModeHealthPlusWait, after.mode)
+	require.Equal(t, 30*time.Second, after.wait)
+	require.Nil(t, edgeFor(s, riOf(b), riOf(mid)), "dropped predecessor's edge must be pruned")
+	_, bEntry := s.chainMap.Load(riOf(b))
+	require.False(t, bEntry, "emptied predecessor entry must be deleted")
+	require.NotNil(t, edgeFor(s, riOf(c), riOf(mid)))
+
+	// an invalid annotation set drops every edge, including the previously valid ones
+	mid.Annotations[RESTART_AFTER_WAIT_KEY] = "not-a-duration"
+	require.NoError(t, s.reconcileJobsForResource(mid))
+	require.Nil(t, edgeFor(s, riOf(a), riOf(mid)))
+	require.Nil(t, edgeFor(s, riOf(c), riOf(mid)))
 }
 
 // TestChainEdgeSurvivesPredecessorChurn covers the ways synchronize routes a
