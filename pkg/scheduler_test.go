@@ -1627,6 +1627,39 @@ func TestChainCycleDetection(t *testing.T) {
 	})
 }
 
+// A cycle-rejected edge is only ever re-evaluated by its follower's own
+// reconcile. This pins the property the informer resync relies on: once the
+// cycle is broken elsewhere, simply reconciling the follower again (as a resync
+// does, with no change to the object) registers the previously rejected edge.
+func TestChainCycleRejectionRecoversOnReconcile(t *testing.T) {
+	t.Parallel()
+
+	a := healthyDeployment("rc-a", map[string]string{CRON_PATTERN_KEY: "* * * * *"})
+	b := healthyStatefulSet("rc-b", map[string]string{RESTART_AFTER_KEY: "deployment/rc-a"})
+	s, _ := newTestSchedulerWithChain(t, time.Minute, a, b)
+	s.cron.Start()
+	defer shutdownCron(s)
+
+	require.NoError(t, s.reconcileJobsForResource(a))
+	require.NoError(t, s.reconcileJobsForResource(b))
+	require.NotNil(t, edgeFor(s, riOf(a), riOf(b)))
+
+	// a now wants to follow b: a->b->a is a cycle, so b->a is rejected
+	a.Annotations[RESTART_AFTER_KEY] = "statefulset/rc-b"
+	require.NoError(t, s.reconcileJobsForResource(a))
+	require.Nil(t, edgeFor(s, riOf(b), riOf(a)))
+
+	// b stops following a; that breaks the cycle but nothing touches a
+	delete(b.Annotations, RESTART_AFTER_KEY)
+	require.NoError(t, s.reconcileJobsForResource(b))
+	require.Nil(t, edgeFor(s, riOf(a), riOf(b)))
+	require.Nil(t, edgeFor(s, riOf(b), riOf(a)), "a's edge is still absent until a is reconciled again")
+
+	// a resync re-reconciles a with the very same object; the edge must appear
+	require.NoError(t, s.reconcileJobsForResource(a))
+	require.NotNil(t, edgeFor(s, riOf(b), riOf(a)), "re-reconcile must register the edge once the cycle is gone")
+}
+
 func TestIsRolloutComplete(t *testing.T) {
 	t.Parallel()
 

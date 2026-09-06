@@ -112,25 +112,33 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func GenerateDeploymentController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
-	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, workchan, metrics)
+// The resyncPeriod on each controller replays every cached object through the
+// workqueue on that interval (0 disables). Reconcile is idempotent, and without
+// a resync a resource is only revisited when the apiserver reports a change to
+// it, so two things would otherwise stick forever: a chain edge rejected for a
+// cycle stays absent after the cycle is broken elsewhere, and a key dropped
+// after exhausting its workqueue retries is never reconciled again.
+
+func GenerateDeploymentController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, resyncPeriod time.Duration, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "deployments", &appsv1.Deployment{}, resyncPeriod, workchan, metrics)
 }
 
-func GenerateDaemonSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
-	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, workchan, metrics)
+func GenerateDaemonSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, resyncPeriod time.Duration, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "daemonsets", &appsv1.DaemonSet{}, resyncPeriod, workchan, metrics)
 }
 
-func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
-	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, workchan, metrics)
+func GenerateStatefulSetController(logger *zap.Logger, clientset kubernetes.Interface, namespace string, resyncPeriod time.Duration, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+	return generateGenericController(logger, clientset.AppsV1().RESTClient(), namespace, "statefulsets", &appsv1.StatefulSet{}, resyncPeriod, workchan, metrics)
 }
 
-func generateGenericController(logger *zap.Logger, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
+func generateGenericController(logger *zap.Logger, restclient rest.Interface, namespace string, typename string, typespecimen runtime.Object, resyncPeriod time.Duration, workchan chan<- ObjectAndSchedulerAction, metrics *KairosMetrics) *Controller {
 	watcher := cache.NewListWatchFromClient(restclient, typename, namespace, fields.Everything())
 	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 
 	store, informer := cache.NewInformerWithOptions(cache.InformerOptions{
 		ListerWatcher: watcher,
 		ObjectType:    typespecimen,
+		ResyncPeriod:  resyncPeriod,
 		Handler: cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				key, err := cache.MetaNamespaceKeyFunc(obj)

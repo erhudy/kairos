@@ -964,6 +964,7 @@ func (s *Scheduler) reconcileChainEdges(obj runtime.Object) {
 		}
 		entry := s.getOrCreateChainEntry(predRi)
 		entry.Lock()
+		prev := entry.edges[ri]
 		// replace the pointer rather than mutating the existing edge: in-flight
 		// chain steps read edge fields without the lock
 		entry.edges[ri] = &chainEdge{
@@ -974,11 +975,15 @@ func (s *Scheduler) reconcileChainEdges(obj runtime.Object) {
 			wait:        wait,
 		}
 		entry.Unlock()
-		s.logger.Info("registered chain edge",
-			zap.String("follower", string(ri)),
-			zap.String("predecessor", string(predRi)),
-			zap.String("mode", chainModeDisplay(mode)),
-		)
+		// reconcile also runs on every informer resync, so only announce edges
+		// that are new or whose settings changed; an unchanged edge is not news
+		if prev == nil || prev.mode != mode || prev.wait != wait {
+			s.logger.Info("registered chain edge",
+				zap.String("follower", string(ri)),
+				zap.String("predecessor", string(predRi)),
+				zap.String("mode", chainModeDisplay(mode)),
+			)
+		}
 	}
 }
 

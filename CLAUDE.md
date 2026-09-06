@@ -33,7 +33,7 @@ workflow pass it to the Dockerfile as `GO_VERSION` (which has no default on
 purpose), and the test workflow uses `go-version-file: go.mod`. Bump `go.mod`
 and everything follows.
 
-Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-chain-timeout` (how long a chained restart waits for its predecessor to become healthy again before aborting the cascade; default 10m), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
+Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-chain-timeout` (how long a chained restart waits for its predecessor to become healthy again before aborting the cascade; default 10m), `-resync` (informer resync period, default 10m; every watched resource is re-reconciled on this interval so a chain edge rejected for a cycle recovers once the cycle is broken and keys dropped after exhausting workqueue retries are revisited; 0 disables), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
 
 ## Architecture
 
@@ -98,4 +98,4 @@ Kubernetes Informer (per resource type)
 - `sync.Map` for resource-to-jobs tracking, with a per-entry `sync.RWMutex` (`resourceMapEntry`) guarding each entry's jobs/lastJitters maps; channels for controller→scheduler communication, and a buffered ack channel on each action so the scheduler reports reconcile failures back to the waiting controller worker (the wait also selects on the controller's stopCh so shutdown isn't blocked by unacked actions)
 - gocron fires each job in its own goroutine; jitter sleeps select on the scheduler's shutdown context and re-check job registration afterward, so deleted jobs don't restart and shutdown isn't blocked
 - `chainMap` (predecessor → follower edges) uses the same per-entry mutex pattern; a `pendingSteps` sync.Map dedupes to one in-flight chain step per follower; chain-step health polls and settle waits select on the scheduler's shutdown context so shutdown isn't blocked by waiting cascades
-- Controllers retry failed items up to 5 times with rate limiting
+- Controllers retry failed items up to 5 times with rate limiting; the informer resync (`-resync`) replays every cached object through the workqueue periodically so nothing stays dropped or rejected forever (reconcile is idempotent, so this is cheap)
