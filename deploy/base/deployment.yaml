@@ -17,8 +17,30 @@ spec:
       serviceAccountName: kairos
       containers:
         - name: kairos
-          image: erhudy/kairos:dev
+          # the release workflow publishes to ghcr.io; the install overlay pins a
+          # release tag on top of this
+          image: ghcr.io/erhudy/kairos:dev
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          # /api/config is served by the scheduler with no apiserver round-trip,
+          # so it reflects the process being up without depending on the cluster
+          livenessProbe:
+            httpGet:
+              path: /api/config
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/config
+              port: http
+            periodSeconds: 10
           resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
             limits:
               cpu: 50m
               memory: 150Mi

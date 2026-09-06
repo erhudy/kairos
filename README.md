@@ -54,8 +54,11 @@ Use the Kustomize directory at `deploy`:
 serviceaccount/kairos created
 clusterrole.rbac.authorization.k8s.io/kairos created
 clusterrolebinding.rbac.authorization.k8s.io/kairos created
+service/kairos created
 deployment.apps/kairos created
 ```
+
+This installs into `kube-system`, pulls the release image from `ghcr.io/erhudy/kairos` at the tag pinned in `deploy/install/kustomization.yaml`, and creates a `kairos` Service on port 9090 fronting the metrics endpoint and web UI.
 
 ## Todos
 

@@ -32,4 +32,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: kairos
-  namespace: kube-system
+  # placeholder: kustomize's namespace transformer rewrites ServiceAccount
+  # subjects to match the overlay's `namespace`, so this tracks wherever the
+  # overlay installs kairos (deploy/install uses kube-system)
+  namespace: default
