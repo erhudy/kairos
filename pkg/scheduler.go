@@ -747,9 +747,12 @@ func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, 
 }
 
 // fireRestart patches the pod template annotation on obj and, when the patch
-// succeeds, triggers any chained followers registered for it.
+// succeeds, triggers any chained followers registered for it. The patch is
+// bound to the shutdown context so no new apiserver work starts once the
+// scheduler is stopping; with -lookback a firing lost this way is caught up on
+// the next start.
 func (s *Scheduler) fireRestart(obj runtime.Object) {
-	if !restartFunc(context.Background(), s.logger, s.clientset, obj, s.metrics) {
+	if !restartFunc(s.shutdownCtx, s.logger, s.clientset, obj, s.metrics) {
 		return
 	}
 	om, objk := getObjectMetaAndKind(obj)
@@ -854,7 +857,9 @@ func (s *Scheduler) runChainStep(predRi resourceIdentifier, edge *chainEdge) {
 				}
 				return
 			}
-			if restartFunc(context.Background(), s.logger, s.clientset, freshObj, s.metrics) {
+			// bound to the shutdown context like fireRestart: a step that reaches
+			// its restart while the scheduler is stopping must not patch anyway
+			if restartFunc(s.shutdownCtx, s.logger, s.clientset, freshObj, s.metrics) {
 				s.triggerFollowers(edge.followerRi)
 				s.refreshChainEdgeObject(predRi, edge.followerRi)
 				record(CHAIN_OUTCOME_COMPLETED)
