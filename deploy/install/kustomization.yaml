@@ -9,6 +9,6 @@ resources:
 images:
 - name: ghcr.io/erhudy/kairos
   newName: ghcr.io/erhudy/kairos
-  newTag: v0.9.0
+  newTag: v1.0.0
 
 namespace: kube-system

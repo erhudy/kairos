@@ -22,10 +22,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 	// -timezone and TZ=-prefixed patterns need zoneinfo at runtime; embedding it
@@ -41,8 +43,24 @@ import (
 	"github.com/erhudy/kairos/pkg"
 )
 
+// version is set at build time via -ldflags "-X main.version=<tag>" (see the
+// Dockerfile and hack/docker-build.sh). When left at "dev", buildVersion falls
+// back to the VCS-derived module version Go stamps into local builds.
+var version = "dev"
+
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
+}
+
 func main() {
 	var debug bool
+	var showVersion bool
 	var kubeconfig string
 	var master string
 	var namespace string
@@ -54,6 +72,7 @@ func main() {
 	var resync time.Duration
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
+	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&master, "master", "", "master url")
 	flag.StringVar(&namespace, "namespace", "", "namespace")
@@ -64,6 +83,11 @@ func main() {
 	flag.DurationVar(&chainTimeout, "chain-timeout", 10*time.Minute, "how long a chained restart waits for its predecessor to become healthy before aborting the cascade (e.g. 30m)")
 	flag.DurationVar(&resync, "resync", 10*time.Minute, "how often every watched resource is re-reconciled even without a change, so rejected chain edges and dropped reconciles recover (e.g. 10m); 0 disables")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println("kairos", buildVersion())
+		return
+	}
 
 	var logger *zap.Logger
 	if debug {
@@ -78,6 +102,7 @@ func main() {
 		logger.Fatal("unable to process given timezone", zap.String("tz", tzstring), zap.Error(err))
 	}
 
+	logger.Info("starting kairos", zap.String("version", buildVersion()))
 	logger.Info("operating with timezone", zap.String("tz", timezone.String()))
 	logger.Info("current time", zap.String("given", time.Now().In(timezone).String()), zap.String("utc", time.Now().UTC().String()))
 

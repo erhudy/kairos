@@ -33,6 +33,8 @@ workflow pass it to the Dockerfile as `GO_VERSION` (which has no default on
 purpose), and the test workflow uses `go-version-file: go.mod`. Bump `go.mod`
 and everything follows.
 
+`-version` prints the build version and exits; it comes from `-ldflags "-X main.version=<tag>"` (the Dockerfile's `VERSION` build arg, set by `hack/docker-build.sh` from `git describe` and by the release workflow from the release tag), falling back to the VCS-derived module version for plain local builds.
+
 Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-chain-timeout` (how long a chained restart waits for its predecessor to become healthy again before aborting the cascade; default 10m), `-resync` (informer resync period, default 10m; every watched resource is re-reconciled on this interval so a chain edge rejected for a cycle recovers once the cycle is broken and keys dropped after exhausting workqueue retries are revisited; 0 disables), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
 
 ## Architecture

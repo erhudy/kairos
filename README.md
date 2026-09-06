@@ -1,6 +1,6 @@
 # Kairos
 
-Kairos is a small Kubernetes controller that exists solely to restart pods based on a cron pattern annotation applied to the controlling resource (`Deployment`, `DaemonSet` or `StatefulSet`). It exists because of the long and storied tradition of restarting services on a regular basis because it's easier than fixing memory leaks, and who wants to wait around for pods to get OOMKilled?
+Kairos is a small Kubernetes controller that restarts workloads (`Deployment`, `DaemonSet` or `StatefulSet`) on a cron schedule declared by annotation, with optional jitter, catch-up of firings missed while it was down, and ordered chains so dependants roll only after what they depend on is healthy again. It exists because of the long and storied tradition of restarting services on a regular basis because it's easier than fixing memory leaks, and who wants to wait around for pods to get OOMKilled?
 
 ## Using
 
@@ -69,6 +69,7 @@ A follower may name several predecessors, but the semantics are **after whicheve
 | `-resync` | `10m` | Informer resync period; every watched resource is re-reconciled on this interval so rejected chain edges and dropped reconciles recover. `0` disables |
 | `-metrics-addr` | `:9090` | Listen address for the metrics endpoint, JSON API, and web UI |
 | `-debug` | `false` | Development-style logging at debug level |
+| `-version` | | Print the build version and exit |
 
 ## Observability
 
@@ -119,3 +120,7 @@ hack/run-integration.sh         # end-to-end suite against a local kind cluster 
 ## Todos
 
 * de-duplicate various code paths through unhealthy `reflect` witchcraft
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
