@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -44,6 +45,7 @@ func NewScheduler(timezone *time.Location, logger *zap.Logger, workchan <-chan O
 		timezone:          timezone,
 		chainTimeout:      chainTimeout,
 		chainPollInterval: CHAIN_POLL_INTERVAL,
+		apiRetryBackoff:   defaultAPIRetryBackoff,
 		chainMap:          &sync.Map{},
 		pendingSteps:      &sync.Map{},
 		startTime:         time.Now(),
@@ -752,7 +754,7 @@ func (s *Scheduler) checkMissedRestartAt(cps []cronPattern, obj runtime.Object, 
 // scheduler is stopping; with -lookback a firing lost this way is caught up on
 // the next start.
 func (s *Scheduler) fireRestart(obj runtime.Object) {
-	if !restartFunc(s.shutdownCtx, s.logger, s.clientset, obj, s.metrics) {
+	if !restartFunc(s.shutdownCtx, s.logger, s.clientset, s.apiRetryBackoff, obj, s.metrics) {
 		return
 	}
 	om, objk := getObjectMetaAndKind(obj)
@@ -847,7 +849,12 @@ func (s *Scheduler) runChainStep(predRi resourceIdentifier, edge *chainEdge) {
 					return
 				}
 			}
-			freshObj, err := s.getWorkload(workloadRef{kind: fKind, namespace: fNs, name: fName})
+			var freshObj runtime.Object
+			err := retryTransientAPIError(s.shutdownCtx, s.logger, s.apiRetryBackoff, "get follower "+string(edge.followerRi), func() error {
+				var err error
+				freshObj, err = s.getWorkload(workloadRef{kind: fKind, namespace: fNs, name: fName})
+				return err
+			})
 			if err != nil {
 				if apierrors.IsNotFound(err) {
 					abort("follower deleted")
@@ -859,7 +866,7 @@ func (s *Scheduler) runChainStep(predRi resourceIdentifier, edge *chainEdge) {
 			}
 			// bound to the shutdown context like fireRestart: a step that reaches
 			// its restart while the scheduler is stopping must not patch anyway
-			if restartFunc(s.shutdownCtx, s.logger, s.clientset, freshObj, s.metrics) {
+			if restartFunc(s.shutdownCtx, s.logger, s.clientset, s.apiRetryBackoff, freshObj, s.metrics) {
 				s.triggerFollowers(edge.followerRi)
 				s.refreshChainEdgeObject(predRi, edge.followerRi)
 				record(CHAIN_OUTCOME_COMPLETED)
@@ -919,8 +926,7 @@ func (s *Scheduler) chainSettleWait(edge *chainEdge, predRi resourceIdentifier) 
 }
 
 func (s *Scheduler) getWorkload(ref workloadRef) (runtime.Object, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), API_CALL_TIMEOUT)
-	defer cancel()
+	ctx := s.shutdownCtx // timeout comes from the clientset config
 	opts := metav1.GetOptions{}
 	switch ref.kind {
 	case "Deployment":
@@ -1249,7 +1255,7 @@ func daemonSetRolloutComplete(ds *appsv1.DaemonSet) bool {
 	return true
 }
 
-func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, incomingObject runtime.Object, metrics *KairosMetrics) bool {
+func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.Interface, backoff wait.Backoff, incomingObject runtime.Object, metrics *KairosMetrics) bool {
 	logger.Debug("entering restartFunc")
 
 	om, _ := getObjectMetaAndKind(incomingObject)
@@ -1262,10 +1268,13 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 	start := time.Now()
 	now := start.Format(LAST_RESTARTED_AT_TIME_FORMAT)
 
-	ctx, cancel := context.WithTimeout(ctx, API_CALL_TIMEOUT)
-	defer cancel()
-
-	supported, err := patchPodTemplateAnnotation(ctx, logger, clientset, incomingObject, CRON_LAST_RESTARTED_AT_KEY, now)
+	// safe to retry: every attempt sends the same timestamp, so a repeat is a no-op
+	var supported bool
+	err := retryTransientAPIError(ctx, logger, backoff, fmt.Sprintf("patch %s %s/%s", kind, namespace, name), func() error {
+		var err error
+		supported, err = patchPodTemplateAnnotation(ctx, logger, clientset, incomingObject, CRON_LAST_RESTARTED_AT_KEY, now)
+		return err
+	})
 	if !supported {
 		return false
 	}
@@ -1280,7 +1289,7 @@ func restartFunc(ctx context.Context, logger *zap.Logger, clientset kubernetes.I
 
 	if metrics != nil {
 		// observed only for successful patches: folding failures in would mix
-		// API_CALL_TIMEOUT expiries into what reads as a restart-latency histogram
+		// API timeouts into what reads as a restart-latency histogram
 		metrics.RestartDuration.WithLabelValues(kind, namespace, name).Observe(time.Since(start).Seconds())
 		metrics.RestartTotal.WithLabelValues(kind, namespace, name).Inc()
 	}

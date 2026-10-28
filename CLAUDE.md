@@ -35,7 +35,7 @@ and everything follows.
 
 `-version` prints the build version and exits; it comes from `-ldflags "-X main.version=<tag>"` (the Dockerfile's `VERSION` build arg, set by `hack/docker-build.sh` from `git describe` and by the release workflow from the release tag), falling back to the VCS-derived module version for plain local builds.
 
-Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-chain-timeout` (how long a chained restart waits for its predecessor to become healthy again before aborting the cascade; default 10m), `-resync` (informer resync period, default 10m; every watched resource is re-reconciled on this interval so a chain edge rejected for a cycle recovers once the cycle is broken and keys dropped after exhausting workqueue retries are revisited; 0 disables), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
+Notable flags: `-timezone` (scheduler timezone), `-jitter` (max random delay before each restart, clamped to 50% of the time until the next firing; 0 disables), `-lookback` (window for catch-up restarts missed while kairos was down; 0 disables), `-chain-timeout` (how long a chained restart waits for its predecessor to become healthy again before aborting the cascade; default 10m), `-resync` (informer resync period, default 10m; every watched resource is re-reconciled on this interval so a chain edge rejected for a cycle recovers once the cycle is broken and keys dropped after exhausting workqueue retries are revisited; 0 disables), `-kube-api-qps`/`-kube-api-burst` (client-side rate limit, default 20/30, applied separately to the informers' clientset and the scheduler's; 0 disables), `-kube-api-timeout` (per-call timeout for restart API calls, default 30s; set as the scheduler clientset's `rest.Config.Timeout` so rate limiter waits don't count against it), `-metrics-addr` (HTTP server for `/metrics`, `/api/jobs`, `/api/config`, and the job-status web UI at `/`).
 
 ## Architecture
 
@@ -70,7 +70,8 @@ Kubernetes Informer (per resource type)
         → checkMissedRestart(): with -lookback, one catch-up restart per resource
           for firings missed while kairos was not running (gated on scheduler startTime)
         → fireRestart() = restartFunc() + triggerFollowers(): patches PodTemplateSpec
-          on schedule (after optional jitter sleep); a successful patch spawns one
+          on schedule (after optional jitter sleep); transient API errors are retried
+          with backoff; a successful patch spawns one
           chain step goroutine per follower (deduped to one in-flight step per follower)
         → runChainStep(): poll predecessor rollout status until healthy (capped by
           -chain-timeout; timeout aborts the cascade), optionally settle-wait, then
@@ -85,6 +86,7 @@ Kubernetes Informer (per resource type)
 - `pkg/scheduler.go` — manages gocron jobs and chain edges per resource; `reconcileJobsForResource()` diffs current vs desired jobs; `restartFunc()` does the actual patch; `runChainStep()`/`isRolloutComplete()` implement the health-gated cascade
 - `pkg/types.go` — core types: `Controller`, `Scheduler`, `SchedulerAction`, `resourceIdentifier`, `chainEdge`/`chainMapEntry`
 - `pkg/constants.go` — annotation key names, chain mode/outcome strings, and time format (RFC3339)
+- `pkg/retry.go` — `retryTransientAPIError()`: backoff retries for scheduler API calls on 429/5xx, dropped connections, and timeouts
 - `pkg/util.go` — helpers for annotation extraction, object metadata, and predecessor-ref parsing (`parsePredecessorRefs`)
 
 ### Cron pattern format

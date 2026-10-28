@@ -38,6 +38,7 @@ func newTestSchedulerWithLookback(t *testing.T, lookback time.Duration, objects 
 	ch := make(chan ObjectAndSchedulerAction, 10)
 	s, err := NewScheduler(tz, logger, ch, clientset, nil, 0, lookback, 10*time.Minute)
 	require.NoError(t, err)
+	s.apiRetryBackoff = testRetryBackoff
 	return s, clientset
 }
 
@@ -115,7 +116,7 @@ func TestRestartFunc(t *testing.T) {
 
 			// Truncate to second precision since RFC3339 drops sub-second
 			startTime := time.Now().Truncate(time.Second)
-			restartFunc(context.Background(), logger, clientset, tt.object, nil)
+			restartFunc(context.Background(), logger, clientset, testRetryBackoff, tt.object, nil)
 
 			// Retrieve the object and verify the annotation was set
 			var obj runtime.Object
@@ -155,7 +156,7 @@ func TestRestartFuncHandlesUnsupportedType(t *testing.T) {
 	logger := zap.NewNop()
 
 	require.NotPanics(t, func() {
-		restartFunc(context.Background(), logger, clientset, unsupported, nil)
+		restartFunc(context.Background(), logger, clientset, testRetryBackoff, unsupported, nil)
 	})
 }
 

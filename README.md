@@ -67,6 +67,9 @@ A follower may name several predecessors, but the semantics are **after whicheve
 | `-lookback` | `0` (off) | Window to check on startup for firings missed while Kairos was down |
 | `-chain-timeout` | `10m` | How long a chained restart waits for its predecessor to become healthy before the cascade is aborted |
 | `-resync` | `10m` | Informer resync period; every watched resource is re-reconciled on this interval so rejected chain edges and dropped reconciles recover. `0` disables |
+| `-kube-api-qps` | `20` | Kubernetes API client rate limit (requests/second). `0` disables |
+| `-kube-api-burst` | `30` | Kubernetes API client rate limit burst |
+| `-kube-api-timeout` | `30s` | Timeout for each restart API call, not counting time queued by the rate limiter. Transient failures are retried up to 5 times |
 | `-metrics-addr` | `:9090` | Listen address for the metrics endpoint, JSON API, and web UI |
 | `-debug` | `false` | Development-style logging at debug level |
 | `-version` | | Print the build version and exit |
@@ -82,8 +85,8 @@ Everything is served on `-metrics-addr`:
 | Metric | Labels | Meaning |
 | --- | --- | --- |
 | `kairos_restart_total` | kind, namespace, name | Successful restarts |
-| `kairos_restart_errors_total` | kind, namespace, name, error_phase | Failed restart patches |
-| `kairos_restart_duration_seconds` | kind, namespace, name | Histogram of successful patch latency |
+| `kairos_restart_errors_total` | kind, namespace, name, error_phase | Failed restart patches (after retries) |
+| `kairos_restart_duration_seconds` | kind, namespace, name | Histogram of successful patch latency, including retries |
 | `kairos_chain_steps_total` | kind, namespace, name, outcome | Chained steps by outcome: `completed`, `timeout`, `aborted` |
 | `kairos_tracked_resources` | kind | Resources currently carrying a Kairos annotation |
 | `kairos_scheduled_jobs` | kind | Cron jobs currently registered |

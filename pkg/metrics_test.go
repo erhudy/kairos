@@ -29,7 +29,7 @@ func TestRestartFuncIncrementsMetrics(t *testing.T) {
 	metrics := NewKairosMetrics()
 	metrics.Register(reg)
 
-	restartFunc(context.Background(), logger, clientset, dep, metrics)
+	restartFunc(context.Background(), logger, clientset, testRetryBackoff, dep, metrics)
 
 	// Verify restart counter was incremented
 	count := testutil.ToFloat64(metrics.RestartTotal.WithLabelValues("Deployment", "ns1", "metric-dep"))
@@ -71,7 +71,7 @@ func TestRestartFuncPatchErrorIncrementsErrorMetric(t *testing.T) {
 	metrics := NewKairosMetrics()
 	metrics.Register(reg)
 
-	restartFunc(context.Background(), logger, clientset, dep, metrics)
+	restartFunc(context.Background(), logger, clientset, testRetryBackoff, dep, metrics)
 
 	// Verify patch error counter was incremented
 	errCount := testutil.ToFloat64(metrics.RestartErrorsTotal.WithLabelValues("Deployment", "ns1", "nonexistent", "patch"))
@@ -141,7 +141,7 @@ func histogramSampleCount(t *testing.T, reg *prometheus.Registry, name string) u
 
 // TestRestartDurationOnlyObservedOnSuccess covers that the restart-latency
 // histogram is not polluted by failures. It previously observed before checking
-// the error, so every failed patch -- including API_CALL_TIMEOUT expiries, which
+// the error, so every failed patch -- including API timeouts, which
 // land at the top of the range -- was folded into what reads as success latency
 // (refs #41).
 func TestRestartDurationOnlyObservedOnSuccess(t *testing.T) {
@@ -159,7 +159,7 @@ func TestRestartDurationOnlyObservedOnSuccess(t *testing.T) {
 		metrics.Register(reg)
 
 		// empty clientset: the patch fails with not found
-		require.False(t, restartFunc(context.Background(), logger, fake.NewClientset(), dep, metrics))
+		require.False(t, restartFunc(context.Background(), logger, fake.NewClientset(), testRetryBackoff, dep, metrics))
 
 		require.Zero(t, histogramSampleCount(t, reg, "kairos_restart_duration_seconds"),
 			"a failed patch must not be recorded as restart latency")
@@ -172,7 +172,7 @@ func TestRestartDurationOnlyObservedOnSuccess(t *testing.T) {
 		metrics := NewKairosMetrics()
 		metrics.Register(reg)
 
-		require.True(t, restartFunc(context.Background(), logger, fake.NewClientset(dep), dep, metrics))
+		require.True(t, restartFunc(context.Background(), logger, fake.NewClientset(dep), testRetryBackoff, dep, metrics))
 
 		require.Equal(t, uint64(1), histogramSampleCount(t, reg, "kairos_restart_duration_seconds"))
 		require.Equal(t, float64(1),
