@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/erhudy/kairos/pkg"
@@ -70,6 +71,9 @@ func main() {
 	var lookback time.Duration
 	var chainTimeout time.Duration
 	var resync time.Duration
+	var kubeAPIQPS float64
+	var kubeAPIBurst int
+	var kubeAPITimeout time.Duration
 
 	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.BoolVar(&showVersion, "version", false, "print the version and exit")
@@ -82,6 +86,9 @@ func main() {
 	flag.DurationVar(&lookback, "lookback", 0, "how far back to check for missed restarts on startup (e.g. 30m); 0 disables")
 	flag.DurationVar(&chainTimeout, "chain-timeout", 10*time.Minute, "how long a chained restart waits for its predecessor to become healthy before aborting the cascade (e.g. 30m)")
 	flag.DurationVar(&resync, "resync", 10*time.Minute, "how often every watched resource is re-reconciled even without a change, so rejected chain edges and dropped reconciles recover (e.g. 10m); 0 disables")
+	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", 20, "Kubernetes API client rate limit in requests per second; 0 disables")
+	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 30, "Kubernetes API client rate limit burst")
+	flag.DurationVar(&kubeAPITimeout, "kube-api-timeout", pkg.DEFAULT_KUBE_API_TIMEOUT, "timeout for each restart API call, excluding time queued by the rate limiter")
 	flag.Parse()
 
 	if showVersion {
@@ -106,10 +113,23 @@ func main() {
 	logger.Info("operating with timezone", zap.String("tz", timezone.String()))
 	logger.Info("current time", zap.String("given", time.Now().In(timezone).String()), zap.String("utc", time.Now().UTC().String()))
 
+	if kubeAPIQPS > 0 && kubeAPIBurst < 1 {
+		logger.Fatal("-kube-api-burst must be at least 1", zap.Int("burst", kubeAPIBurst))
+	}
+	if kubeAPITimeout <= 0 {
+		logger.Fatal("-kube-api-timeout must be positive", zap.Duration("timeout", kubeAPITimeout))
+	}
+
 	// creates the connection
 	config, err := clientcmd.BuildConfigFromFlags(master, kubeconfig)
 	if err != nil {
 		logger.Fatal("unable to build Kubernetes client config", zap.Error(err))
+	}
+	if kubeAPIQPS > 0 {
+		config.QPS = float32(kubeAPIQPS)
+		config.Burst = kubeAPIBurst
+	} else {
+		config.QPS = -1 // client-go treats 0 as its default of 5
 	}
 
 	workchan := make(chan pkg.ObjectAndSchedulerAction, 10)
@@ -129,7 +149,16 @@ func main() {
 	statefulSetController := pkg.GenerateStatefulSetController(logger, clientset, namespace, resync, workchan, metrics)
 	daemonSetController := pkg.GenerateDaemonSetController(logger, clientset, namespace, resync, workchan, metrics)
 
-	scheduler, err := pkg.NewScheduler(timezone, logger, workchan, clientset, metrics, maxJitter, lookback, chainTimeout)
+	// set as rest.Config.Timeout rather than a context deadline so it starts after
+	// the rate limiter wait; separate client so the timeout doesn't hit the watches
+	schedulerConfig := rest.CopyConfig(config)
+	schedulerConfig.Timeout = kubeAPITimeout
+	schedulerClientset, err := kubernetes.NewForConfig(schedulerConfig)
+	if err != nil {
+		logger.Fatal("unable to build scheduler Kubernetes clientset", zap.Error(err))
+	}
+
+	scheduler, err := pkg.NewScheduler(timezone, logger, workchan, schedulerClientset, metrics, maxJitter, lookback, chainTimeout)
 	if err != nil {
 		logger.Fatal("unable to create scheduler", zap.Error(err))
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/go-co-op/gocron/v2"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -107,6 +108,8 @@ type Scheduler struct {
 	// chainPollInterval is how often a chain step re-checks predecessor health;
 	// a field (not just CHAIN_POLL_INTERVAL) so tests can shrink it
 	chainPollInterval time.Duration
+	// apiRetryBackoff is a field so tests can shrink it
+	apiRetryBackoff wait.Backoff
 	// chainMap maps predecessor resourceIdentifier -> *chainMapEntry of followers
 	chainMap *sync.Map
 	// pendingSteps dedupes to one in-flight chain step per follower, keyed by
